@@ -81,7 +81,7 @@ wow-server 只接受 **https + 443 + 根路径** 的 Agent 地址，自定义域
 
 - `/v1/user/playlist/list` 会合并两个平台的歌单，并用 `QQ` / `网易云` 标签区分。
 - 面板可设置每日推荐与漫游来源：本地 / QQ / 网易云；所选平台失败时自动回退本地。
-- QQ 漫游可切换 **雷达**（radar）与 **刷歌**（radio）。
+- QQ 漫游可切换 **雷达**（radar）与 **猜你喜欢**（radio）。
 - 平台歌单是只读的：不能改名、删除或拖动。
 
 ### 4. 维护
@@ -145,7 +145,7 @@ npx wrangler deploy --dry-run --outdir dist
 | Agent 显示离线 | wow-server 出站被 SSRF 规则拦截，或 Agent 域名不可达 |
 | 平台显示「登录已失效」 | 重新扫码；平台风控或改密都会让旧 Cookie 失效 |
 | 平台显示「降级」 | 网络抖动，Agent 会在 15 分钟后重试；可手动重新扫码 |
-| QQ 漫游为空 | 某些账号的雷达/刷歌需要先在客户端使用过；换另一个模式试试 |
+| QQ 漫游为空 | 某些账号的雷达/猜你喜欢需要先在客户端使用过；换另一个模式试试 |
 | 免费版偶发超时 | 升级 Workers Paid，或减少同时在线的 wow-server 请求 |
 
 日志默认开启 observability；日志里不应出现 Cookie / token / 签名。若发现泄露，请按
@@ -169,7 +169,7 @@ src/
     v1.ts           # wow-server 只读接口（验签 + 响应签名）
     redact.ts       # 日志脱敏
   admin/            # OAuth 登录、会话与 CSRF、CSP、服务端渲染管理页
-  qq/               # 扫码、musicu.fcg、歌单/每日/雷达/刷歌
+  qq/               # 扫码、musicu.fcg、歌单/每日/雷达/猜你喜欢
   netease/          # 扫码、weapi、歌单/每日/Personal FM
 test/               # Vitest：共享签名向量、加密、映射、v1 签名
 ```

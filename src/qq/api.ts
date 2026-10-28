@@ -212,7 +212,7 @@ export function dailyPlaylistID(feed: Record<string, unknown>): string {
  * 漫游。
  *
  * - `radar`：雷达（`GetRadarSong`），是平台按听歌关系推的「雷达歌单」；
- * - `radio`：刷歌，也就是 QQ 客户端的「猜你喜欢」电台（固定 `id: 99`）。
+ * - `radio`：猜你喜欢，也就是 QQ 客户端的「猜你喜欢」电台（固定 `id: 99`）。
  *
  * `style` 只影响 radio：上游电台本身没有口味参数，这里用「我喜欢」里的歌手集合
  * 给返回曲目重排——`familiar` 熟悉歌手优先，`fresh` 陌生歌手优先，`balanced`
@@ -242,11 +242,11 @@ export async function fetchRoam(
       .filter((item) => item.id !== "")
       .slice(0, size);
   }
-  // radio（刷歌）：单次只返回几首，循环累积；最多 5 次上游调用，与 wow-server 的计划一致。
+  // radio（猜你喜欢）：单次只返回几首，循环累积；最多 5 次上游调用，与 wow-server 的计划一致。
   //
   // `id: 99` 是「猜你喜欢」这个电台的固定 id；`firstplay` 必须显式给 0。
   // 之前传的是 `song_num/play_flag`，服务端忽略掉 id 后落到了默认电台——
-  // 于是「刷歌」返回的全是助眠歌单里的曲目。
+  // 于是「猜你喜欢」返回的全是助眠歌单里的曲目。
   const result: AgentTrack[] = [];
   const seen = new Set<string>();
   for (let round = 0; round < 5 && result.length < size; round += 1) {
