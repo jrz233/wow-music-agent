@@ -91,6 +91,13 @@ export function mergeCookies(current: string, response: Response): string {
   return serializeCookies(jar);
 }
 
+/** 在 Cookie 串里写入一项（已存在则覆盖）。 */
+export function withCookie(jar: string, key: string, value: string): string {
+  const map = parseCookies(jar);
+  map.set(key, value);
+  return serializeCookies(map);
+}
+
 export function parseCookies(raw: string): Map<string, string> {
   const result = new Map<string, string>();
   for (const part of raw.split(";")) {

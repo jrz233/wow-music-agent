@@ -18,9 +18,9 @@ export interface NeteaseQRCode {
 }
 
 export type NeteaseLoginState =
-  | { state: "waiting" }
-  | { state: "scanned" }
-  | { state: "expired" }
+  | { state: "waiting"; cookie: string }
+  | { state: "scanned"; cookie: string }
+  | { state: "expired"; cookie: string }
   | { state: "success"; credentials: PlatformCredentials };
 
 export async function beginNeteaseLogin(): Promise<NeteaseQRCode> {
@@ -49,7 +49,9 @@ export async function pollNeteaseLogin(key: string, cookie: string): Promise<Net
       },
     };
   }
-  return result;
+  // 轮询响应会带新的 Cookie（NMTID / __csrf 之类），必须回存：丢掉它，下次轮询
+  // 就是一个「陌生客户端」，上游认不出这次扫码，状态会从「已扫码」退回「等待扫码」。
+  return { state: result.state, cookie: result.cookie };
 }
 
 /** 用已保存的 Cookie 探活并刷新。返回新的凭据或 null（已登出）。 */

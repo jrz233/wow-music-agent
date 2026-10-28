@@ -193,6 +193,27 @@ describe("QQ QR login", () => {
     await expect(client.checkQR()).rejects.toThrow(/p_skey/u);
     expect(seen.some((item) => item.body.includes("QQConnectLogin.LoginServer"))).toBe(false);
   });
+
+  it("轮询回到吐出二维码的那台机器", async () => {
+    const seen = stubFetch([
+      // xui 这一路拿不到图，落到 ssl 那一路。
+      { match: "xui.ptlogin2.qq.com", reply: { body: "<html>维护中</html>" } },
+      { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
+      { match: "ptqrlogin", reply: { body: "ptuiCB('66','0','','0','二维码未失效。','')" } },
+    ]);
+
+    const first = new QQClient();
+    const qr = await first.createQR();
+    expect(qr.endpoint).toBe("ssl");
+
+    // 换一个新的 client（管理页每次轮询都是新请求）——入口标识必须跟着会话走，
+    // 否则轮询跑到另一台机器上，qrsig 对不上，状态永远停在「等待扫码」。
+    const second = new QQClient(qr.cookie, qr.endpoint);
+    await second.checkQR();
+
+    const poll = seen.find((item) => item.url.includes("ptqrlogin"));
+    expect(poll?.url).toContain("ssl.ptlogin2.qq.com/ptqrlogin");
+  });
 });
 
 describe("QQ data calls", () => {

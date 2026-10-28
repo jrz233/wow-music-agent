@@ -18,6 +18,7 @@ import {
   unpair,
 } from "../agent/oauth";
 import { platformView, nextRefreshAt, storeLogin } from "../agent/refresh";
+import { redact } from "../agent/redact";
 import type { AgentStore } from "../agent/store";
 import { AgentError, badRequest, forbidden } from "../shared/errors";
 import { beginNeteaseLogin, pollNeteaseLogin } from "../netease/auth";
@@ -160,7 +161,9 @@ export function createAdminApp(
     }
     try {
       const start = await beginQQLogin();
-      store.saveQR("qq", "", start.cookie, now());
+      // QQ 的 `key` 列存的是入口标识（xui / ssl），不是二维码 key——轮询必须回到
+      // 同一台机器，qrsig 才对得上。
+      store.saveQR("qq", start.endpoint, start.cookie, now());
       const nonce = newNonce();
       return html(
         qrPage({
@@ -212,7 +215,7 @@ export function createAdminApp(
       return json({ state: "expired" });
     }
     try {
-      const result = await pollQQLogin(qr.cookie);
+      const result = await pollQQLogin(qr.cookie, qr.key === "ssl" ? "ssl" : "xui");
       if (result.state === "success") {
         const nextAt = await storeLogin(store, "qq", result.credentials);
         await scheduleRefresh(nextAt);
@@ -221,7 +224,11 @@ export function createAdminApp(
       store.saveQR("qq", qr.key, result.cookie, qr.createdAt);
       return json({ state: result.state });
     } catch (error) {
-      return json({ state: "error", message: publicMessage(error) }, 502);
+      const message = publicMessage(error);
+      // 扫码失败的原因必须能在日志里看到：页面上只显示「等待扫码」的话，
+      // 用户和排查的人都是两眼一抹黑。
+      console.error("qq login poll failed", { message, detail: redact(error) });
+      return json({ state: "error", message }, 502);
     }
   });
 
@@ -242,9 +249,14 @@ export function createAdminApp(
         await scheduleRefresh(nextAt);
         return json({ state: "success", nickname: result.credentials.nickname });
       }
+      // 轮询响应里带回来的 Cookie 要回存：丢掉它，下次轮询就换了身份，
+      // 上游认不出这次扫码，状态会从「已扫码」退回「等待扫码」。
+      store.saveQR("netease", qr.key, result.cookie, qr.createdAt);
       return json({ state: result.state });
     } catch (error) {
-      return json({ state: "error", message: publicMessage(error) }, 502);
+      const message = publicMessage(error);
+      console.error("netease login poll failed", { message, detail: redact(error) });
+      return json({ state: "error", message }, 502);
     }
   });
 

@@ -13,7 +13,7 @@
  *  - 两种接口都要装成「客户端 / 浏览器」，否则风控会挡。
  */
 
-import { mergeCookies, parseCookies, platformFetch } from "../shared/http";
+import { mergeCookies, parseCookies, platformFetch, withCookie } from "../shared/http";
 import { unavailable } from "../shared/errors";
 import { checkToken } from "./checktoken";
 import { eapiDecrypt, eapiParams, eapiPath, weapi } from "./crypto";
@@ -57,10 +57,27 @@ export interface QRCode {
 }
 
 export type QRState =
-  | { state: "waiting" }
-  | { state: "scanned" }
-  | { state: "expired" }
+  | { state: "waiting"; cookie: string }
+  | { state: "scanned"; cookie: string }
+  | { state: "expired"; cookie: string }
   | { state: "success"; cookies: string };
+
+/**
+ * 网易云客户端的设备标识。
+ *
+ * 参考实现（wow-origin `platforms/netease/NeteasePlatform.js`）在进程启动时生成一个
+ * 52 位大写十六进制的 `deviceId`，**整个会话固定不变**，并同时放进 eapi 请求的
+ * `header` 与 Cookie 头里。
+ *
+ * 这个值就是网易云眼里的「客户端身份」：二维码的 unikey 与发起扫码的客户端绑在一
+ * 起，轮询时身份对不上，上游就当没扫过（一直 801），或者扫过之后又退回 801。少了
+ * 它，扫码状态就飘。
+ */
+export function newDeviceId(): string {
+  const bytes = new Uint8Array(26);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
 
 export interface RequestOptions {
   /** 带上 `x-anticheattoken`；只有少数接口（Personal FM）需要。 */
@@ -92,7 +109,13 @@ export class NeteaseClient {
   ): Promise<Record<string, unknown>> {
     const apiPath = path.startsWith("/api/") ? path : `/api/${path}`;
     const deviceHeader: Record<string, unknown> = { ...DEVICE_HEADER };
-    const musicU = parseCookies(this.cookie).get("MUSIC_U");
+    const jar = parseCookies(this.cookie);
+    // 设备标识：与参考实现一致，扫码的发起方与轮询方必须是同一个「客户端」。
+    const deviceId = jar.get("deviceId");
+    if (deviceId) {
+      deviceHeader.deviceId = deviceId;
+    }
+    const musicU = jar.get("MUSIC_U");
     if (musicU) {
       // 请求头里的 MUSIC_U 用解码后的形式，Cookie 头里用原始形式——和上游一致。
       deviceHeader.MUSIC_U = decodeCookieValue(musicU);
@@ -102,7 +125,7 @@ export class NeteaseClient {
       Referer: REFERER,
       Origin: MUSIC_BASE,
       "User-Agent": DESKTOP_UA,
-      Cookie: this.eapiCookie(),
+      Cookie: this.platformCookie(),
     };
     if (options.antiCheat) {
       const token = checkToken("eapi");
@@ -146,7 +169,9 @@ export class NeteaseClient {
       Referer: REFERER,
       Origin: MUSIC_BASE,
       "User-Agent": WEB_UA,
-      Cookie: this.cookie,
+      // weapi 与 eapi 用同一套 Cookie 形态（参考实现也是如此）：设备四件套 +
+      // deviceId + 会话 Cookie 一起带上。
+      Cookie: this.platformCookie(),
     };
     if (options.antiCheat) {
       headers["x-anticheattoken"] = checkToken("weapi");
@@ -188,6 +213,10 @@ export class NeteaseClient {
   }
 
   async createQR(): Promise<QRCode> {
+    // 设备标识要在**取 unikey 之前**就定下来：后面的每一次轮询都要用同一个。
+    if (!parseCookies(this.cookie).get("deviceId")) {
+      this.cookie = withCookie(this.cookie, "deviceId", newDeviceId());
+    }
     const data = await this.eapiRequest("login/qrcode/unikey", { type: 3 });
     const key = String(data.unikey ?? "");
     if (!key) {
@@ -204,12 +233,12 @@ export class NeteaseClient {
       return { state: "success", cookies: this.cookie };
     }
     if (code === 802) {
-      return { state: "scanned" };
+      return { state: "scanned", cookie: this.cookie };
     }
     if (code === 800) {
-      return { state: "expired" };
+      return { state: "expired", cookie: this.cookie };
     }
-    return { state: "waiting" };
+    return { state: "waiting", cookie: this.cookie };
   }
 
   /** 读取当前登录账号；失败抛错（Cookie 失效会返回 code 301）。 */
@@ -236,12 +265,13 @@ export class NeteaseClient {
   }
 
   /**
-   * eapi 请求带出去的 Cookie。
+   * 请求带出去的 Cookie。
    *
-   * 设备四件套是网易云客户端的固定指纹；`MUSIC_U` 用**原始**值（Cookie 头里必须是
-   * 编码后的形式），其余自己攒的 Cookie（NMTID / __csrf）一起带上。
+   * 设备四件套是网易云客户端的固定指纹；`deviceId` 是这台「客户端」的身份，
+   * 扫码期间必须始终一致；`MUSIC_U` 用**原始**值（Cookie 头里必须是编码后的形式），
+   * 其余自己攒的 Cookie（NMTID / __csrf）一起带上。
    */
-  private eapiCookie(): string {
+  private platformCookie(): string {
     const jar = parseCookies(this.cookie);
     const parts = [
       `os=${DEVICE_HEADER.os}`,

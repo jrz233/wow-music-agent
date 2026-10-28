@@ -48,6 +48,8 @@ const ANDROID_CHID = "10003505";
  * Cookie；轮询 `ptqrlogin` 时要带上 `pt_login_sig`，缺失会影响扫码成功后的换票。
  */
 interface QQEndpoint {
+  /** 入口标识：二维码会话要记下来，轮询必须回到同一台机器。 */
+  id: "xui" | "ssl";
   base: string;
   show: string;
   poll: string;
@@ -57,6 +59,7 @@ interface QQEndpoint {
 
 const QQ_ENDPOINTS: QQEndpoint[] = [
   {
+    id: "xui",
     base: "https://xui.ptlogin2.qq.com",
     show: "/ssl/ptqrshow",
     poll: "/ssl/ptqrlogin",
@@ -64,6 +67,7 @@ const QQ_ENDPOINTS: QQEndpoint[] = [
     needsXLogin: true,
   },
   {
+    id: "ssl",
     base: "https://ssl.ptlogin2.qq.com",
     show: "/ptqrshow",
     poll: "/ptqrlogin",
@@ -77,6 +81,18 @@ const MUSIC_HEADERS = {
   Referer: REFERER,
   Origin: "https://y.qq.com",
 };
+
+/**
+ * 登录链路专用的浏览器形态。
+ *
+ * 与参考实现（wow-origin `platforms/qqmusic/util/login-http.js`）一致：Windows +
+ * Chrome + 中文 Accept-Language。ptlogin 对「不像网页的请求」会直接回异常状态码，
+ * 表现就是扫码状态不推进。
+ */
+const LOGIN_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/141.0.0.0 Safari/537.36";
+const LOGIN_LANGUAGE = "zh-CN,zh;q=0.9";
 
 /** 设备指纹。`QQLogin` 要求同一个身份贯穿 GetSession 与换票；刷新时也要复用。 */
 interface QQDevice {
@@ -112,9 +128,11 @@ export class QQClient {
   /** 真正吐出二维码的那个入口；轮询必须回到同一台机器，否则 qrsig 对不上。 */
   private endpoint: QQEndpoint;
 
-  constructor(cookie = "") {
+  constructor(cookie = "", endpointId: "xui" | "ssl" = "xui") {
     this.cookie = cookie;
-    this.endpoint = QQ_ENDPOINTS[0] as QQEndpoint;
+    this.endpoint =
+      QQ_ENDPOINTS.find((endpoint) => endpoint.id === endpointId) ??
+      (QQ_ENDPOINTS[0] as QQEndpoint);
   }
 
   /** 登录后凭据里的 QQ 号（纯数字）。`uin`/`musicid` 都可能是它。 */
@@ -139,7 +157,7 @@ export class QQClient {
    * ptqrshow 回的 PNG **不带 content-type 头**，所以这里只认魔数；
    * 拿不到图就换另一个入口（主机与路径要配对，见 QQ_ENDPOINTS）。
    */
-  async createQR(): Promise<{ imageDataUrl: string; cookie: string }> {
+  async createQR(): Promise<{ imageDataUrl: string; cookie: string; endpoint: "xui" | "ssl" }> {
     const query = new URLSearchParams({
       appid: APPID,
       e: "2",
@@ -159,7 +177,12 @@ export class QQClient {
           await this.xlogin(endpoint);
         }
         const response = await platformFetch(`${endpoint.base}${endpoint.show}?${query.toString()}`, {
-          headers: { Referer: endpoint.referer, Accept: "image/*" },
+          headers: {
+            Referer: endpoint.referer,
+            Accept: "image/*",
+            "User-Agent": LOGIN_UA,
+            "Accept-Language": LOGIN_LANGUAGE,
+          },
           redirect: "manual",
         });
         this.cookie = mergeCookies(this.cookie, response);
@@ -174,7 +197,7 @@ export class QQClient {
           continue;
         }
         this.endpoint = endpoint;
-        return { imageDataUrl: imageDataUrl(bytes, mime), cookie: this.cookie };
+        return { imageDataUrl: imageDataUrl(bytes, mime), cookie: this.cookie, endpoint: endpoint.id };
       } catch (error) {
         failure = error as Error;
       }
@@ -196,7 +219,12 @@ export class QQClient {
       pt_3rd_aid: PT_3RD_AID,
     }).toString();
     const response = await platformFetch(url.toString(), {
-      headers: { Referer: `${endpoint.base}/`, Accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
+      headers: {
+        Referer: `${endpoint.base}/`,
+        Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+        "User-Agent": LOGIN_UA,
+        "Accept-Language": LOGIN_LANGUAGE,
+      },
       redirect: "manual",
     });
     this.cookie = mergeCookies(this.cookie, response);
@@ -226,9 +254,17 @@ export class QQClient {
       aid: APPID,
       daid: DAID,
       pt_3rd_aid: PT_3RD_AID,
+      // 与参考实现一致：缺这个参数上游会按旧版页面处理，扫码状态可能不推进。
+      pt_js_version: "28d22679",
     });
     const response = await platformFetch(`${this.endpoint.base}${this.endpoint.poll}?${query.toString()}`, {
-      headers: { Referer: this.endpoint.referer, Cookie: this.cookie, Accept: "*/*" },
+      headers: {
+        Referer: this.endpoint.referer,
+        Cookie: this.cookie,
+        Accept: "*/*",
+        "User-Agent": LOGIN_UA,
+        "Accept-Language": LOGIN_LANGUAGE,
+      },
       redirect: "manual",
     });
     this.cookie = mergeCookies(this.cookie, response);
@@ -290,6 +326,9 @@ export class QQClient {
         Referer: this.endpoint.referer,
         Cookie: this.cookie,
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": LOGIN_UA,
+        "Accept-Language": LOGIN_LANGUAGE,
+        "Upgrade-Insecure-Requests": "1",
       },
       redirect: "manual",
     });
@@ -300,7 +339,11 @@ export class QQClient {
       .map((key) => cookieValue(this.cookie, key))
       .find((value) => value !== "");
     if (!pSkey) {
-      throw unavailable("QQ 会话校验未返回 p_skey");
+      // 带上 HTTP 状态与是否发生跳转：少了 p_skey 的原因就在这两者里。
+      const location = check.headers.get("location");
+      throw unavailable(
+        `QQ 会话校验未返回 p_skey (HTTP ${check.status}${location ? ", 有跳转" : ""})`,
+      );
     }
 
     const ui = crypto.randomUUID().replace(/-/gu, "").toUpperCase();
@@ -328,6 +371,9 @@ export class QQClient {
         "Content-Type": "application/x-www-form-urlencoded",
         Cookie: `${this.cookie}; ui=${ui}`,
         Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+        "User-Agent": LOGIN_UA,
+        "Accept-Language": LOGIN_LANGUAGE,
+        "Upgrade-Insecure-Requests": "1",
       },
       body: body.toString(),
       redirect: "manual",

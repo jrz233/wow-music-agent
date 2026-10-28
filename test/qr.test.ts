@@ -261,4 +261,43 @@ describe("NetEase QR", () => {
     expect(success.state).toBe("success");
     expect(success.state === "success" && success.cookies).toContain("MUSIC_U=abc%2Cdef%3D");
   });
+
+  it("整个扫码会话用同一个设备标识", async () => {
+    const calls: { url: string; body: string; headers: Record<string, string> }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({
+          url,
+          body: String(init?.body ?? ""),
+          headers: (init?.headers ?? {}) as Record<string, string>,
+        });
+        if (url.includes("/eapi/login/qrcode/unikey")) {
+          return eapiResponse({ code: 200, unikey: "KEY-123" });
+        }
+        return eapiResponse({ code: 801 });
+      }),
+    );
+
+    const client = new NeteaseClient();
+    const qr = await client.createQR();
+    await client.checkQR(qr.key);
+
+    const unikey = calls.find((call) => call.url.includes("/eapi/login/qrcode/unikey"));
+    const poll = calls.find((call) => call.url.includes("/eapi/login/qrcode/client/login"));
+    expect(unikey).toBeTruthy();
+    expect(poll).toBeTruthy();
+
+    // 设备标识（deviceId）就是网易云眼里的「客户端身份」：取 key 与轮询必须是
+    // 同一个，否则上游认不出这次扫码，状态会从「已扫码」退回「等待扫码」。
+    const deviceId = (decodeEapiParams(unikey?.body ?? "").header as Record<string, unknown>)
+      .deviceId;
+    expect(deviceId).toMatch(/^[0-9A-F]{52}$/u);
+    expect(
+      (decodeEapiParams(poll?.body ?? "").header as Record<string, unknown>).deviceId,
+    ).toBe(deviceId);
+    // Cookie 头里也要带上同一个标识。
+    expect(unikey?.headers.Cookie).toContain(`deviceId=${String(deviceId)}`);
+    expect(poll?.headers.Cookie).toContain(`deviceId=${String(deviceId)}`);
+  });
 });

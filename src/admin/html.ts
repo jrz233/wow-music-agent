@@ -177,6 +177,13 @@ export function qrPage(options: {
           hint.innerHTML = '<a class="button" href="/admin/${platform}">刷新二维码</a>';
           if (qr) qr.classList.add('expired');
           return;
+        } else if (data.state === 'error') {
+          // 失败原因必须显示出来：以前一律显示「等待扫码」，扫码成功却换票失败时
+          // 用户只看到「等待扫码」，完全不知道卡在哪一步。
+          stopped = true;
+          status.textContent = data.message || '登录失败，请重试';
+          hint.innerHTML = '<a class="button" href="/admin/${platform}">重新获取二维码</a>';
+          return;
         } else { status.textContent = '等待扫码…'; }
       } catch (error) {
         status.textContent = '网络异常，稍后重试…';

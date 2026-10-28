@@ -15,6 +15,8 @@ export interface QQLoginStart {
   imageDataUrl: string;
   /** 轮询时必须带上的 Cookie（至少包含 qrsig）。 */
   cookie: string;
+  /** 吐出二维码的那个入口（xui / ssl）：轮询必须回到同一台机器。 */
+  endpoint: "xui" | "ssl";
 }
 
 export type QQLoginPoll =
@@ -29,11 +31,11 @@ const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export async function beginQQLogin(): Promise<QQLoginStart> {
   const client = new QQClient();
   const qr = await client.createQR();
-  return { imageDataUrl: qr.imageDataUrl, cookie: qr.cookie };
+  return { imageDataUrl: qr.imageDataUrl, cookie: qr.cookie, endpoint: qr.endpoint };
 }
 
-export async function pollQQLogin(cookie: string): Promise<QQLoginPoll> {
-  const client = new QQClient(cookie);
+export async function pollQQLogin(cookie: string, endpoint: "xui" | "ssl" = "xui"): Promise<QQLoginPoll> {
+  const client = new QQClient(cookie, endpoint);
   const result: QQLoginState = await client.checkQR();
   if (result.state === "success") {
     return {
