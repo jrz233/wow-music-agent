@@ -33,15 +33,17 @@ export async function pollNeteaseLogin(key: string, cookie: string): Promise<Net
   const client = new NeteaseClient(cookie);
   const result: QRState = await client.checkQR(key);
   if (result.state === "success") {
-    const account = await client.account();
+    // 昵称是次要的：扫码成功就意味着 MUSIC_U 已经拿到了，读账号信息失败不该把
+    // 这次登录判成失败（用户只能重新扫码，很烦）。留空由后面的刷新补。
+    const account = await client.account().catch(() => null);
     // 先滚动一次有效期；失败不阻断登录（MUSIC_U 本身可能仍是有效的）。
     await client.refresh().catch(() => false);
     return {
       state: "success",
       credentials: {
-        accountId: account.userId,
-        nickname: account.nickname,
-        avatarUrl: account.avatarUrl,
+        accountId: account?.userId ?? "",
+        nickname: account?.nickname ?? "",
+        avatarUrl: account?.avatarUrl ?? "",
         credential: client.cookie || result.cookies,
         expiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
       },
@@ -58,11 +60,12 @@ export async function refreshNetease(cookie: string): Promise<PlatformCredential
     if (!ok) {
       return null;
     }
-    const account = await client.account();
+    // 刷新成功就说明会话还在；读账号信息失败只影响昵称显示，不该把用户踢下线。
+    const account = await client.account().catch(() => null);
     return {
-      accountId: account.userId,
-      nickname: account.nickname,
-      avatarUrl: account.avatarUrl,
+      accountId: account?.userId ?? "",
+      nickname: account?.nickname ?? "",
+      avatarUrl: account?.avatarUrl ?? "",
       credential: client.cookie,
       expiresAt: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60,
     };
