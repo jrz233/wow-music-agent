@@ -13,6 +13,8 @@ import { NeteaseClient } from "./client";
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
+/** Personal FM 一次只给几首，靠连问几轮凑队列。 */
+const FM_ROUNDS = 3;
 
 export async function fetchPlaylists(client: NeteaseClient, limit = DEFAULT_LIMIT): Promise<AgentPlaylist[]> {
   const account = await client.account();
@@ -68,8 +70,32 @@ export async function fetchDaily(client: NeteaseClient, limit = DEFAULT_LIMIT): 
 
 export async function fetchRoam(client: NeteaseClient, limit = DEFAULT_LIMIT): Promise<AgentTrack[]> {
   // Personal FM 走 weapi，并带风控令牌——少了会被判成爬虫。
-  const data = await client.callWeb("v1/radio/get", {}, { antiCheat: true });
-  return array(data.data).map(mapTrack).slice(0, clampLimit(limit));
+  //
+  // 上游**一次只给 3~5 首**，但每次调用都会往后翻（同一账号会话连着问，拿到的是
+  // 不同的歌）。要凑够一队列就得连问几轮：每轮按 id 去重，一旦某轮没有新歌就停，
+  // 免得上游返回重复内容时在这里空转。
+  //
+  // 轮数取 3：每轮约 1~2 秒（weapi 往返），3 轮足够凑出十几首，又不会把
+  // wow-server 侧的读取超时顶穿。
+  const size = clampLimit(limit);
+  const result: AgentTrack[] = [];
+  const seen = new Set<string>();
+  for (let round = 0; round < FM_ROUNDS && result.length < size; round += 1) {
+    const data = await client.callWeb("v1/radio/get", {}, { antiCheat: true });
+    let added = 0;
+    for (const track of array(data.data).map(mapTrack)) {
+      if (!track.id || seen.has(track.id)) {
+        continue;
+      }
+      seen.add(track.id);
+      result.push(track);
+      added += 1;
+    }
+    if (added === 0) {
+      break;
+    }
+  }
+  return result.slice(0, size);
 }
 
 async function likedPlaylistID(client: NeteaseClient): Promise<string> {
