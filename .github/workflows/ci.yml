@@ -12,11 +12,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # 打包一遍但不发布：wrangler 的配置错误（绑定名、migration、入口路径）只有真正
+      # 打包时才报，tsc 与 vitest 都看不见。`--dry-run` 不碰任何 Cloudflare 资源。
+      - name: 打包检查
+        run: npx wrangler deploy --dry-run --outdir dist
