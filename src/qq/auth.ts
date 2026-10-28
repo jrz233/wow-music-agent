@@ -1,9 +1,10 @@
 /**
  * QQ 音乐扫码登录编排。
  *
- * 只把「平台返回的 Cookie」当作凭据：QQ 音乐没有可用的 refresh_token 协议，
- * 长周期 Cookie（`qqmusic_key`/`skey`/`uin`）就是会话本身。因此这里不伪造刷新，
- * 而是定期用一次只读请求探活；探活失败就标记 `logged_out`，让用户重新扫码。
+ * 凭据形如 `uin=<musicid>; qm_keyst=<musickey>`（外加 refresh_token/refresh_key
+ * 等续期材料），由 `client.checkQR()` 通过 `QQConnectLogin.LoginServer/QQLogin`
+ * 换得。QQ 音乐没有公开的 refresh_token 协议文档，但有 refresh 材料时优先走
+ * `music.login.LoginServer/Login` 滚动 musickey；没有材料就用一次资料请求探活。
  */
 
 import type { PlatformCredentials } from "../agent/store";
@@ -22,7 +23,7 @@ export type QQLoginPoll =
   | { state: "expired"; cookie: string }
   | { state: "success"; credentials: PlatformCredentials };
 
-/** Cookie 在平台侧的有效期没有公开承诺；这里按 30 天滚动探活。 */
+/** musickey 的公开有效期约 90 天；这里按到期前滚动探活、30 天续一次。 */
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 export async function beginQQLogin(): Promise<QQLoginStart> {
@@ -49,27 +50,26 @@ export async function pollQQLogin(cookie: string): Promise<QQLoginPoll> {
   return { state: result.state, cookie: client.cookie };
 }
 
-/** 探活 + 滚动到期时间。凭据失效返回 null；网络错误向上抛（标记 degraded）。 */
+/** 探活 / 续期。凭据失效返回 null；网络错误向上抛（标记 degraded）。 */
 export async function refreshQQ(cookie: string): Promise<PlatformCredentials | null> {
   const client = new QQClient(cookie);
+  let result;
   try {
-    await client.call("music.musichallSongListServer", "GetUserMusicList", {
-      uin: client.uin,
-      offset: 0,
-      limit: 1,
-      order: 0,
-    });
+    result = await client.refresh();
   } catch (error) {
     if (error instanceof PlatformNetworkError) {
       throw error;
     }
     return null;
   }
+  if (!result) {
+    return null;
+  }
   return {
     accountId: client.uin,
-    nickname: "",
-    avatarUrl: "",
-    credential: client.cookie,
+    nickname: result.nickname || "",
+    avatarUrl: result.avatarUrl || "",
+    credential: result.credential,
     expiresAt: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
   };
 }

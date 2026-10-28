@@ -12,29 +12,51 @@ import { QQClient } from "./client";
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
 
+/**
+ * 用户歌单 = 自建 + 收藏。
+ *
+ * 以前用 `music.musichallSongListServer/GetUserMusicList`，那个模块对当前客户端
+ * 版本已经不可用（恒回 `500003`）。正确的一对是：
+ *   - 自建：`music.musicasset.PlaylistBaseRead/GetPlaylistByUin`
+ *   - 收藏：`music.musicasset.PlaylistFavRead/GetPlaylistFavInfo`
+ * 两者的响应结构也不同（`v_playlist` 用 `dirName`，`v_list` 用 `name`）。
+ */
 export async function fetchPlaylists(client: QQClient, limit = DEFAULT_LIMIT): Promise<AgentPlaylist[]> {
-  const data = await client.call("music.musichallSongListServer", "GetUserMusicList", {
-    uin: client.uin,
-    offset: 0,
-    limit: 100,
-    order: 0,
-  });
-  const lists = firstArray(data, ["v_list", "list", "disslist", "data"]);
-  return lists.map(mapPlaylist).filter((item) => item.id !== "").slice(0, clampLimit(limit));
+  const uin = client.uin;
+  const created = await client.call("music.musicasset.PlaylistBaseRead", "GetPlaylistByUin", { uin });
+  const liked = await client
+    .call("music.musicasset.PlaylistFavRead", "GetPlaylistFavInfo", { uin })
+    .catch(() => ({}));
+  const merged = [
+    ...firstArray(created, ["v_playlist", "v_list"]).map(mapPlaylist),
+    ...firstArray(liked, ["v_list", "v_playlist"]).map(mapPlaylist),
+  ].filter((item) => item.id !== "");
+  const seen = new Set<string>();
+  const unique = merged.filter((item) => (seen.has(item.id) ? false : (seen.add(item.id), true)));
+  return unique.slice(0, clampLimit(limit));
 }
 
+/**
+ * 歌单详情。
+ *
+ * `music.srfDissInfo.aiDissInfo/uniform_get_Dissinfo` 是当前客户端在用的模块；
+ * 旧的 `DissInfo/CgiGetDiss` 仍然可用，但推荐/私人雷达这类系统歌单只在前者里
+ * 稳定返回 `songlist`，所以统一走新模块。
+ */
 export async function fetchPlaylistDetail(
   client: QQClient,
   id: string,
   limit = DEFAULT_LIMIT,
 ): Promise<AgentPlaylistDetail> {
-  const data = await client.call("music.srfDissInfo.DissInfo", "CgiGetDiss", {
+  const data = await client.call("music.srfDissInfo.aiDissInfo", "uniform_get_Dissinfo", {
     disstid: id,
-    dirid: 0,
+    userinfo: 1,
     tag: 1,
+    orderlist: 1,
     song_begin: 0,
     song_num: clampLimit(limit),
-    userinfo: 1,
+    onlysonglist: 0,
+    enc_host_uin: "",
   });
   const info = asRecord(data.dirinfo) ?? asRecord(data.info) ?? data;
   const tracks = firstArray(data, ["songlist", "songs", "list"])
@@ -42,16 +64,22 @@ export async function fetchPlaylistDetail(
     .filter((item) => item.id !== "");
   return {
     ...mapPlaylist(info),
-    id: text(info.dissid) || text(info.dirId) || id,
+    id: text(info.dissid) || text(info.id) || text(info.dirId) || id,
     tracks: tracks.slice(0, clampLimit(limit)),
   };
 }
 
+/**
+ * 「我喜欢的音乐」。
+ *
+ * QQ 的收藏不是独立接口，而是一张名为「我喜欢」的普通歌单（自建列表里）。
+ * 以前按 `id === "201"` 猜——那是网易云的 `specialType` 语义，QQ 上没有这个 id。
+ */
 export async function fetchFavorites(client: QQClient, limit = DEFAULT_LIMIT): Promise<AgentTrack[]> {
-  const playlists = await fetchPlaylists(client, MAX_LIMIT);
-  const liked =
-    playlists.find((item) => item.id === "201") ??
-    playlists.find((item) => item.name.includes("喜欢"));
+  const uin = client.uin;
+  const created = await client.call("music.musicasset.PlaylistBaseRead", "GetPlaylistByUin", { uin });
+  const playlists = firstArray(created, ["v_playlist", "v_list"]).map(mapPlaylist);
+  const liked = playlists.find((item) => item.name.includes("我喜欢"));
   if (!liked) {
     return [];
   }
@@ -59,27 +87,54 @@ export async function fetchFavorites(client: QQClient, limit = DEFAULT_LIMIT): P
   return detail.tracks;
 }
 
+/**
+ * 每日推荐。
+ *
+ * `get_recommend_feed` 返回的是**货架（shelf）结构**，不是曲目列表：里面是一堆
+ * 推荐卡片，其中标题为「每日30首」的那张卡的 `id` 才是一张**歌单**的 id。直接
+ * `extractTracks()` 在这个结构上永远得到空数组——这就是「每日推荐拿不到」的原因。
+ *
+ * 因此两步：先取卡片拿 id，再按普通歌单拉曲目。模块名是 `RecommendFeed`
+ * （没有 `Server` 后缀），带后缀的调用返回 code != 0。
+ */
 export async function fetchDaily(client: QQClient, limit = DEFAULT_LIMIT): Promise<AgentTrack[]> {
-  const first = await client
-    .call("music.recommend.RecommendFeedServer", "get_recommend_feed", {
-      direction: 0,
-      page: 0,
-      v_cache: 0,
-      uin: client.uin,
-    })
-    .catch(() => ({}));
-  let tracks = extractTracks(first).map(mapTrack);
-  if (tracks.length === 0) {
-    const second = await client
-      .call("music.recommend.RecommendSonglistServer", "get_recommend_songlist", {
-        direction: 0,
-        page: 0,
-        uin: client.uin,
-      })
-      .catch(() => ({}));
-    tracks = extractTracks(second).map(mapTrack);
+  const feed = await client.call("music.recommend.RecommendFeed", "get_recommend_feed", {
+    direction: 0,
+    page: 1,
+    v_cache: [],
+    v_uniq: [],
+    s_num: 0,
+  });
+  const playlistID = dailyPlaylistID(feed);
+  if (!playlistID) {
+    return [];
   }
-  return tracks.filter((item) => item.id !== "").slice(0, clampLimit(limit));
+  const detail = await fetchPlaylistDetail(client, playlistID, clampLimit(limit));
+  return detail.tracks.slice(0, clampLimit(limit));
+}
+
+/** 从货架结构里找出「每日30首」卡片的 id（歌单 id）。 */
+export function dailyPlaylistID(feed: Record<string, unknown>): string {
+  // 卡片不一定在第一格：未登录/新账号时货架顺序会变，[0] 常是运营位。
+  // 所以遍历全部 shelf 与 niche，按标题找，而不是只取 `[0][0]`。
+  const shelves = firstArray(feed, ["v_shelf"]);
+  for (const shelf of shelves) {
+    const record = asRecord(shelf);
+    if (!record) continue;
+    for (const niche of firstArray(record, ["v_niche"])) {
+      const nicheRecord = asRecord(niche);
+      if (!nicheRecord) continue;
+      for (const card of firstArray(nicheRecord, ["v_card"])) {
+        const cardRecord = asRecord(card);
+        if (!cardRecord) continue;
+        if (text(cardRecord.title) === "每日30首") {
+          const id = text(cardRecord.id);
+          if (id) return id;
+        }
+      }
+    }
+  }
+  return "";
 }
 
 export async function fetchRoam(
@@ -89,21 +144,34 @@ export async function fetchRoam(
 ): Promise<AgentTrack[]> {
   const size = clampLimit(limit);
   if (mode === "radar") {
+    // 雷达的参数是固定的 `Page/NeedNum/ReqType`；`VecSongs[].Track` 才是曲目。
+    // 以前传 `PageSize/From` 属于另一个接口的字段，服务端只当没收到，于是空数组。
     const data = await client.call("music.recommend.TrackRelationServer", "GetRadarSong", {
-      PageSize: size,
-      From: "",
-      uin: client.uin,
+      LastToastTime: Date.now(),
+      NeedNum: 149,
+      Page: 1,
+      ReqType: 0,
     });
-    return extractTracks(data).map(mapTrack).slice(0, size);
+    const songs = Array.isArray(data.VecSongs) ? data.VecSongs : [];
+    return songs
+      .map((item) => asRecord(asRecord(item)?.Track))
+      .filter(Boolean)
+      .map((item) => mapTrack(item))
+      .filter((item) => item.id !== "")
+      .slice(0, size);
   }
   // radio（刷歌）：单次只返回几首，循环累积；最多 5 次上游调用，与 wow-server 的计划一致。
+  //
+  // `id: 99` 是「猜你喜欢」这个电台的固定 id；`firstplay` 必须显式给 0。
+  // 之前传的是 `song_num/play_flag`，服务端忽略掉 id 后落到了默认电台——
+  // 于是「刷歌」返回的全是助眠歌单里的曲目。
   const result: AgentTrack[] = [];
   const seen = new Set<string>();
   for (let round = 0; round < 5 && result.length < size; round += 1) {
     const data = await client.call("music.radioProxy.MbTrackRadioSvr", "get_radio_track", {
-      song_num: size - result.length,
-      uin: client.uin,
-      play_flag: 1,
+      id: 99,
+      firstplay: 0,
+      num: Math.min(5, size - result.length),
     });
     const batch = extractTracks(data).map(mapTrack);
     let added = 0;
@@ -123,6 +191,7 @@ export function mapPlaylist(raw: unknown): AgentPlaylist {
   const tags = [
     ...stringArray(value.tag),
     ...stringArray(value.tagList),
+    ...stringArray(value.tagNameList),
     ...stringArray(value.tags),
   ];
   return {
@@ -133,6 +202,8 @@ export function mapPlaylist(raw: unknown): AgentPlaylist {
       text(value.diss_cover) ||
       text(value.dirPicUrl) ||
       text(value.picurl) ||
+      text(value.picUrl) ||
+      text(value.logo) ||
       text(value.cover),
     trackCount:
       integer(value.song_cnt) ||
@@ -141,8 +212,8 @@ export function mapPlaylist(raw: unknown): AgentPlaylist {
       integer(value.total_song_num),
     playCount: integer(value.listen_num) || integer(value.playCount) || integer(value.visitnum),
     tags: [...new Set(tags)],
-    createdAt: seconds(value.create_time) ?? seconds(value.ctime),
-    updatedAt: seconds(value.update_time) ?? seconds(value.mtime),
+    createdAt: seconds(value.create_time) ?? seconds(value.createTime) ?? seconds(value.ctime),
+    updatedAt: seconds(value.update_time) ?? seconds(value.updateTime) ?? seconds(value.mtime),
   };
 }
 

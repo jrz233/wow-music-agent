@@ -1,11 +1,20 @@
 /**
  * QQ 音乐扫码登录与 musicu.fcg 传输层。
  *
- * QQ 的登录链路比网易云长：ptlogin 二维码 → `ptuiCB` 成功 URL → graph.qq.com
- * 的 302 链 → y.qq.com 的 Cookie。这里手动跟随重定向，逐个响应合并 Set-Cookie，
- * 最终只保留 `qqmusic_*` / `uin` / `skey` 等 QQ 音乐自己认的键。
+ * 登录链路（与官方 Android 客户端一致，参考 wow-origin 的 `qq-login.js`）：
  *
- * QQ 的私有接口会随客户端版本变化，因此所有读取都走一个宽松的 `musicu()`：
+ *   xlogin → ptqrshow（二维码）
+ *     → ptqrlogin（轮询）
+ *       → check_sig（换取 graph.qq.com 的 p_skey）
+ *         → graph.qq.com/oauth2.0/authorize（拿到一次性 code）
+ *           → QQConnectLogin.LoginServer / QQLogin（用 code 换 **musickey**）
+ *
+ * **关键**：只有 `QQLogin` 会把 code 换成 `str_musicid` + `musickey`，最终 Cookie 是
+ * `uin=<musicid>; qm_keyst=<musickey>`。以前这里跟 302 链抓网页版 Cookie
+ * （`qqmusic_key`），那条路的 `uin` 是空的，数据接口会一律回 `500003` / `1000`
+ * —— 面板表现为「QQ 在线但歌单/每日/漫游都拿不到」。
+ *
+ * QQ 的私有接口会随客户端版本变化，因此所有读取都走一个宽松的 `call()`：
  * 只要求 `code === 0`，字段映射在 `api.ts` 里做多路兼容。
  */
 
@@ -14,11 +23,19 @@ import { unavailable } from "../shared/errors";
 import { imageDataUrl, sniffImageMime } from "../shared/image";
 
 const LOGIN_JUMP = "https://graph.qq.com/oauth2.0/login_jump";
+const GRAPH_AUTHORIZE = "https://graph.qq.com/oauth2.0/authorize";
+const REDIRECT_URI =
+  "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/";
 const MUSICU = "https://u.y.qq.com/cgi-bin/musicu.fcg";
+const PROFILE = "https://c6.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg";
 const REFERER = "https://y.qq.com/";
 const APPID = "716027609";
 const DAID = "383";
 const PT_3RD_AID = "100497308";
+/** 与客户端一致的 Android 身份；`QQLogin` 只认这套 comm。 */
+const ANDROID_UA = "QQMusic 14090008(android 15)";
+const ANDROID_CV = 14090008;
+const ANDROID_CHID = "10003505";
 
 /**
  * ptlogin 的两个入口。
@@ -61,6 +78,12 @@ const MUSIC_HEADERS = {
   Origin: "https://y.qq.com",
 };
 
+/** 设备指纹。`QQLogin` 要求同一个身份贯穿 GetSession 与换票；刷新时也要复用。 */
+interface QQDevice {
+  androidId: string;
+  openUdid: string;
+}
+
 export interface QQAccount {
   userId: string;
   nickname: string;
@@ -78,6 +101,12 @@ export interface QQConflict {
 
 export type QQLoginState = QQConflict | { state: "success"; result: QQLoginResult };
 
+export interface QQRefreshResult {
+  credential: string;
+  nickname: string;
+  avatarUrl: string;
+}
+
 export class QQClient {
   cookie: string;
   /** 真正吐出二维码的那个入口；轮询必须回到同一台机器，否则 qrsig 对不上。 */
@@ -88,11 +117,20 @@ export class QQClient {
     this.endpoint = QQ_ENDPOINTS[0] as QQEndpoint;
   }
 
+  /** 登录后凭据里的 QQ 号（纯数字）。`uin`/`musicid` 都可能是它。 */
   get uin(): string {
-    const numeric = cookieValue(this.cookie, "qqmusic_uin");
-    if (numeric) return numeric;
-    const raw = cookieValue(this.cookie, "uin");
-    return raw.replace(/^o/u, "");
+    for (const key of ["qqmusic_uin", "uin", "musicid", "str_musicid"]) {
+      const raw = cookieValue(this.cookie, key).replace(/^o/u, "");
+      if (/^[1-9]\d*$/u.test(raw)) {
+        return raw;
+      }
+    }
+    return "";
+  }
+
+  /** 换票用的一次性密钥 `qm_keyst`（长周期，登录后一直用它）。 */
+  get musickey(): string {
+    return cookieValue(this.cookie, "qm_keyst") || cookieValue(this.cookie, "musickey");
   }
 
   /**
@@ -165,7 +203,7 @@ export class QQClient {
     await response.arrayBuffer().catch(() => undefined);
   }
 
-  /** 轮询扫码状态。成功时返回登录后的 Cookie 与账号信息。 */
+  /** 轮询扫码状态。成功时返回登录后的凭据与账号信息。 */
   async checkQR(): Promise<QQLoginState> {
     const qrsig = cookieValue(this.cookie, "qrsig");
     if (!qrsig) {
@@ -199,7 +237,7 @@ export class QQClient {
     if (!parsed) {
       return { state: "waiting" };
     }
-    if (parsed.code === "65") {
+    if (parsed.code === "65" || parsed.code === "68") {
       return { state: "expired" };
     }
     if (parsed.code === "67") {
@@ -209,46 +247,262 @@ export class QQClient {
       return { state: "waiting" };
     }
     const credential = await this.followLogin(parsed.url);
-    const uin = this.uin || cookieValue(credential, "qqmusic_uin");
-    const nickname = parsed.nickname || uin;
+    const uin = cookieValue(credential, "uin").replace(/^o/u, "");
     return {
       state: "success",
       result: {
         credential,
         account: {
           userId: uin,
-          nickname,
-          avatarUrl: uin ? `https://q1.qlogo.cn/g?b=qq&nk=${encodeURIComponent(uin)}&s=140` : "",
+          nickname: parsed.nickname || uin,
+          avatarUrl: avatarFor(uin),
         },
       },
     };
   }
 
   /**
-   * 跟随 ptuiCB 返回的 URL，收集整条 302 链上的 Cookie。
-   * 遇到 `y.qq.com` 且已经拿到 `qqmusic_key` 就停止，避免继续跳到无关页面。
+   * 扫码成功后把一次性 code 换成 **musickey** 凭据。
+   *
+   * 两步：先走 graph.qq.com 授权拿 `code`，再调 Android 的 `QQLogin` 换票。
+   * 之前这里只是跟着 302 抓网页版 Cookie，`uin` 是空的，数据接口全部返回
+   * `500003`（未登录）/ `1000`（凭据过期）——这就是「QQ 显示已登录但什么都拿不到」。
    */
-  private async followLogin(url: string): Promise<string> {
-    let current = url;
-    let cookies = this.cookie;
-    for (let hop = 0; hop < 10; hop += 1) {
-      const response = await platformFetch(current, {
-        headers: { Referer: REFERER, Cookie: cookies },
-        redirect: "manual",
-      });
-      cookies = mergeCookies(cookies, response);
-      const location = response.headers.get("location");
-      if (!location) {
-        break;
-      }
-      current = new URL(location, current).toString();
-      const host = new URL(current).hostname;
-      if (host === "y.qq.com" && cookieValue(cookies, "qqmusic_key")) {
-        break;
+  private async followLogin(jumpUrl: string): Promise<string> {
+    const code = await this.authorize(jumpUrl);
+    const device = newDevice();
+    const data = await this.qqLogin(code, device);
+    return credentialCookies(data, device);
+  }
+
+  /** check_sig → graph.qq.com/oauth2.0/authorize → `code`。 */
+  private async authorize(jumpUrl: string): Promise<string> {
+    const jump = new URL(jumpUrl);
+    // 跳转地址由 QQ 自己给出，但 Worker 会真的去请求它；限定 https + qq.com。
+    if (jump.protocol !== "https:" || !isQQHost(jump.hostname)) {
+      throw unavailable("QQ 登录跳转地址异常");
+    }
+    if (!jump.searchParams.get("uin") || !jump.searchParams.get("ptsigx")) {
+      throw unavailable("QQ 登录跳转缺少 uin 或 ptsigx");
+    }
+    const check = await platformFetch(jump.toString(), {
+      headers: {
+        Referer: this.endpoint.referer,
+        Cookie: this.cookie,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+      redirect: "manual",
+    });
+    this.cookie = mergeCookies(this.cookie, check);
+    await check.arrayBuffer().catch(() => undefined);
+
+    const pSkey = ["p_skey", "p_sKey", "skey", "pskey"]
+      .map((key) => cookieValue(this.cookie, key))
+      .find((value) => value !== "");
+    if (!pSkey) {
+      throw unavailable("QQ 会话校验未返回 p_skey");
+    }
+
+    const ui = crypto.randomUUID().replace(/-/gu, "").toUpperCase();
+    const body = new URLSearchParams({
+      response_type: "code",
+      client_id: PT_3RD_AID,
+      redirect_uri: REDIRECT_URI,
+      scope: "get_user_info,get_app_friends",
+      state: Math.random().toString(36).slice(2),
+      switch: "",
+      from_ptlogin: "1",
+      src: "1",
+      update_auth: "1",
+      openapi: "1010_1030",
+      // g_tk = hash33(p_skey, 5381)；这个种子与 ptlogin 不同，别混用。
+      g_tk: String(hash33(pSkey, 5381)),
+      auth_time: String(Date.now()),
+      ui,
+    });
+    const response = await platformFetch(GRAPH_AUTHORIZE, {
+      method: "POST",
+      headers: {
+        Origin: "https://graph.qq.com",
+        Referer: this.endpoint.referer,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `${this.cookie}; ui=${ui}`,
+        Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+      },
+      body: body.toString(),
+      redirect: "manual",
+    });
+    const location = response.headers.get("location") ?? "";
+    await response.arrayBuffer().catch(() => undefined);
+    const code = codeFrom(location);
+    if (!code) {
+      throw unavailable("QQ 授权未返回 code");
+    }
+    return code;
+  }
+
+  /** `QQConnectLogin.LoginServer/QQLogin`：用一次性 code 换 musickey。 */
+  private async qqLogin(code: string, device: QQDevice): Promise<Record<string, unknown>> {
+    const session = await this.androidCall(
+      "music.getSession.session",
+      "GetSession",
+      { uid: "", vkey: 0, caller: 2 },
+      {},
+      device,
+    );
+    const value = asRecord(session.session) ?? {};
+    const uid = text(value.uid);
+    const sid = text(value.sid);
+    if (!uid || !sid) {
+      throw unavailable("QQ 音乐未返回 Android 会话");
+    }
+    const data = await this.androidCall(
+      "QQConnectLogin.LoginServer",
+      "QQLogin",
+      { code },
+      { uid, sid, tmeLoginType: 2 },
+      device,
+    );
+    const musicid = text(data.str_musicid) || text(data.musicid);
+    const musickey = text(data.musickey);
+    if (!/^[1-9]\d*$/u.test(musicid) || !musickey) {
+      throw unavailable("QQ 音乐未返回有效登录凭证");
+    }
+    return data;
+  }
+
+  /** Android 身份的 CGI 调用；comm 里所有值都转成字符串（换票接口只认字符串）。 */
+  private async androidCall(
+    module: string,
+    method: string,
+    param: Record<string, unknown>,
+    extra: Record<string, unknown>,
+    device: QQDevice,
+  ): Promise<Record<string, unknown>> {
+    const comm = {
+      ct: 11,
+      cv: ANDROID_CV,
+      v: ANDROID_CV,
+      chid: ANDROID_CHID,
+      tmeAppID: "qqmusic",
+      OpenUDID: device.openUdid,
+      udid: device.openUdid,
+      OpenUDID2: device.openUdid,
+      aid: device.androidId,
+      os_ver: "15",
+      phonetype: "V2408A",
+      ...extra,
+    };
+    const body = JSON.stringify({
+      comm: Object.fromEntries(Object.entries(comm).map(([key, value]) => [key, String(value)])),
+      req_0: { module, method, param },
+    });
+    const response = await platformFetch(MUSICU, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": ANDROID_UA },
+      body,
+    });
+    const payload = await jsonOf(response);
+    const request = asRecord(payload.req_0) ?? {};
+    const result = asRecord(request.data) ?? {};
+    const code = Number(request.code ?? -1);
+    if (code !== 0) {
+      throw unavailable(`QQ 音乐登录失败 (${method} ${code})`);
+    }
+    return result;
+  }
+
+  /**
+   * 用 refresh_token 续期；没有刷新材料时只做探活。
+   *
+   * 返回 null 表示凭据已失效（需要重新扫码）；抛 `PlatformNetworkError` 表示网络
+   * 问题（上层标记 degraded 稍后重试）。
+   */
+  async refresh(): Promise<QQRefreshResult | null> {
+    const musicid = this.uin;
+    const musickey = this.musickey;
+    if (!musicid || !musickey) {
+      return null;
+    }
+    const device = deviceFrom(this.cookie);
+    const refreshToken = cookieValue(this.cookie, "refresh_token");
+    const refreshKey = cookieValue(this.cookie, "refresh_key");
+    if (refreshToken && refreshKey) {
+      const data = await this.androidCall(
+        "music.login.LoginServer",
+        "Login",
+        {
+          openid: cookieValue(this.cookie, "openid"),
+          refresh_token: refreshToken,
+          refresh_key: refreshKey,
+          musickey,
+          loginMode: 2,
+          access_token: cookieValue(this.cookie, "access_token"),
+          expired_in: Number(cookieValue(this.cookie, "expired_at")) || 0,
+          musicid: Number(musicid),
+        },
+        { musicid, musickey, loginType: 2, tmeLoginType: 2 },
+        device,
+      ).catch(() => null);
+      if (data) {
+        const credential = credentialCookies(data, device);
+        return {
+          credential,
+          nickname: text(data.nick),
+          avatarUrl: avatarFor(musicid),
+        };
       }
     }
-    this.cookie = cookies;
-    return cookies;
+    const profile = await this.profile();
+    if (!profile) {
+      return null;
+    }
+    return {
+      credential: this.cookie,
+      nickname: profile.nickname,
+      avatarUrl: avatarFor(musicid),
+    };
+  }
+
+  /** 用「读自己的资料」探活；返回 null 表示凭据无效。 */
+  async profile(): Promise<{ nickname: string } | null> {
+    const musicid = this.uin;
+    const musickey = this.musickey;
+    if (!musicid || !musickey) {
+      return null;
+    }
+    const url = new URL(PROFILE);
+    url.search = new URLSearchParams({
+      g_tk: String(hash33(musickey, 5381)),
+      format: "json",
+      inCharset: "utf-8",
+      outCharset: "utf-8",
+      notice: "0",
+      cid: "205360838",
+      needNewCode: "0",
+      loginUin: musicid,
+      hostUin: "0",
+      userid: musicid,
+      reqfrom: "1",
+    }).toString();
+    const response = await platformFetch(url.toString(), {
+      headers: { Referer: REFERER, Cookie: this.credentialCookie() },
+    });
+    const payload = await jsonOf(response).catch(() => null);
+    if (!payload || Number(payload.code ?? -1) !== 0) {
+      return null;
+    }
+    const data = asRecord(payload.data) ?? {};
+    const creator = asRecord(data.creator) ?? {};
+    return { nickname: text(creator.nick) };
+  }
+
+  /** 只要换票后的凭据；不要把二维码阶段的 Cookie 一起发给数据接口。 */
+  private credentialCookie(): string {
+    const jar = parseCookies(this.cookie);
+    return [`uin=${this.uin}`, `qm_keyst=${this.musickey}`]
+      .concat([...jar.entries()].filter(([key]) => key.startsWith("qq_")).map(([k, v]) => `${k}=${v}`))
+      .join("; ");
   }
 
   /** 调一个 musicu 模块；返回 `req_0.data`。 */
@@ -266,46 +520,36 @@ export class QQClient {
     });
     const response = await platformFetch(MUSICU, {
       method: "POST",
-      headers: { ...MUSIC_HEADERS, Cookie: this.cookie },
+      headers: { ...MUSIC_HEADERS, Cookie: this.credentialCookie() },
       body,
     });
     this.cookie = mergeCookies(this.cookie, response);
-    const text = await response.text();
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      throw unavailable("QQ 音乐返回的不是 JSON");
+    const payload = await jsonOf(response);
+    const request = asRecord(payload.req_0) ?? {};
+    if (Number(request.code ?? -1) !== 0) {
+      // 带上上游 code：没有它就只能看到「返回错误」，无从区分「没登录」与
+      // 「参数写错了」。code 不是凭据，可以出现在错误信息里（会进 last_error 与
+      // wow-server 的调试日志），body 与 Cookie 一律不出现。
+      throw unavailable(`QQ 音乐接口返回错误 (${method} ${Number(request.code ?? -1)})`);
     }
-    const request = payload.req_0 as Record<string, unknown> | undefined;
-    if (!request || Number(request.code ?? -1) !== 0) {
-      throw unavailable("QQ 音乐接口返回错误");
-    }
-    return (request.data as Record<string, unknown> | undefined) ?? {};
+    return asRecord(request.data) ?? {};
   }
 
-  /** 用「拉一张歌单」探活；成功即视为 Cookie 仍有效。 */
+  /** 探活：资料接口能读即视为凭据仍有效。 */
   async alive(): Promise<boolean> {
     try {
-      await this.call("music.musichallSongListServer", "GetUserMusicList", {
-        uin: this.uin,
-        offset: 0,
-        limit: 1,
-        order: 0,
-      });
-      return true;
+      return (await this.profile()) !== null;
     } catch {
       return false;
     }
   }
 }
 
-/** QQ 的 ptqrtoken 算法：hash33。 */
-export function hash33(value: string): number {
-  let hash = 0;
+/** QQ 的 ptqrtoken / g_tk 算法：hash33。`seed` 只有 g_tk 用 5381。 */
+export function hash33(value: string, seed = 0): number {
+  let hash = seed;
   for (const character of value) {
-    hash = (hash << 5) + hash + character.charCodeAt(0);
-    hash &= 0x7fffffff;
+    hash = (hash * 33 + character.charCodeAt(0)) & 0x7fffffff;
   }
   return hash;
 }
@@ -341,4 +585,108 @@ export function cookiesFrom(response: Response): string[] {
 
 export function cookieJar(raw: string): Map<string, string> {
   return parseCookies(raw);
+}
+
+/* ───────────────────────────── 内部工具 ───────────────────────────── */
+
+/** 授权回跳里的 `code`；可能在 query，也可能在 `#` 后面（微信/QQ 两套写法都有）。 */
+function codeFrom(location: string): string {
+  if (!location) return "";
+  try {
+    const url = new URL(location, "https://graph.qq.com/");
+    const fromQuery = url.searchParams.get("code");
+    if (fromQuery) return fromQuery;
+    return new URLSearchParams(url.hash.replace(/^#/u, "")).get("code") ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function isQQHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "qq.com" || host.endsWith(".qq.com");
+}
+
+/**
+ * 把 `QQLogin` 的返回整理成 Cookie 串。
+ *
+ * `uin` + `qm_keyst` 是数据接口唯一认的两项；其余（`refresh_*`、`openid` 等）
+ * 用于续期。它们与平台密码同级，只会落在 DO 的 AES-GCM 密文里。
+ */
+function credentialCookies(data: Record<string, unknown>, device: QQDevice): string {
+  const musicid = text(data.str_musicid) || text(data.musicid);
+  const musickey = text(data.musickey);
+  if (!/^[1-9]\d*$/u.test(musicid) || !musickey) {
+    throw unavailable("QQ 音乐未返回有效登录凭证");
+  }
+  const jar: [string, string][] = [
+    ["uin", musicid],
+    ["qm_keyst", musickey],
+    ["musicid", musicid],
+    ["loginType", "2"],
+    ["android_id", device.androidId],
+    ["open_udid", device.openUdid],
+  ];
+  for (const key of [
+    "openid",
+    "unionid",
+    "access_token",
+    "refresh_token",
+    "refresh_key",
+    "expired_at",
+    "musickeyCreateTime",
+    "keyExpiresIn",
+  ]) {
+    const value = text(data[key]);
+    if (value !== "") {
+      jar.push([key, value]);
+    }
+  }
+  return jar.map(([key, value]) => `${key}=${value}`).join("; ");
+}
+
+function randomHex(bytes: number): string {
+  const buffer = new Uint8Array(bytes);
+  crypto.getRandomValues(buffer);
+  return [...buffer].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function newDevice(): QQDevice {
+  return { androidId: randomHex(8), openUdid: randomHex(16) };
+}
+
+/** 续期必须复用登录时的设备身份；缺失时现生成一个（仅影响风控，不影响正确性）。 */
+function deviceFrom(cookie: string): QQDevice {
+  const androidId = cookieValue(cookie, "android_id");
+  const openUdid = cookieValue(cookie, "open_udid");
+  if (/^[0-9a-f]{16}$/u.test(androidId) && /^[0-9a-f]{32}$/u.test(openUdid)) {
+    return { androidId, openUdid };
+  }
+  return newDevice();
+}
+
+function avatarFor(uin: string): string {
+  return uin ? `https://q1.qlogo.cn/g?b=qq&nk=${encodeURIComponent(uin)}&s=140` : "";
+}
+
+async function jsonOf(response: Response): Promise<Record<string, unknown>> {
+  const text = await response.text();
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw unavailable("QQ 音乐返回的不是 JSON");
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function text(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value) && value !== 0) return String(value);
+  return "";
 }
