@@ -92,20 +92,64 @@ export function setCookies(response: Response): string[] {
   return values.flatMap(splitSetCookie);
 }
 
-/** 把 `Set-Cookie` 的键值对合并进一个 `k=v; k=v` 字符串。 */
-export function mergeCookies(current: string, response: Response): string {
-  const jar = parseCookies(current);
-  for (const header of setCookies(response)) {
+/**
+ * 把 `Set-Cookie` 行合并进 Cookie jar；同名 Cookie 以**最后一个非空值**为准。
+ *
+ * 登录链上服务端会用 `name=; Max-Age=0` 清掉旧 Cookie，也可能先清再下发新值。
+ * 空值覆盖已有值会把刚拿到的 `p_skey` 抹掉，所以空值只在原本没有该 Cookie 时记录。
+ */
+export function applySetCookieLines(jar: Map<string, string>, headers: string[]): Map<string, string> {
+  for (const header of headers) {
     const pair = header.split(";")[0] ?? "";
     const index = pair.indexOf("=");
     if (index <= 0) continue;
     const key = pair.slice(0, index).trim();
     const value = pair.slice(index + 1).trim();
-    if (key) {
-      jar.set(key, value);
+    if (!key) continue;
+    if (value === "" && jar.has(key)) continue;
+    jar.set(key, value);
+  }
+  return jar;
+}
+
+/** 把 `Set-Cookie` 的键值对合并进一个 `k=v; k=v` 字符串。 */
+export function mergeCookies(current: string, response: Response): string {
+  return serializeCookies(applySetCookieLines(parseCookies(current), setCookies(response)));
+}
+
+/**
+ * 从 `Set-Cookie` 行里挑出浏览器会带给 `host` 的 Cookie。
+ *
+ * 只认带 `Domain` 且域名匹配的 Cookie：没有 `Domain` 的是下发主机（ptlogin）的
+ * 主机独占 Cookie，浏览器不会把它带到 `check_sig` 所在的另一台机器上。
+ */
+export function cookiesForHost(headers: string[], host: string): Map<string, string> {
+  const target = host.toLowerCase();
+  const result = new Map<string, string>();
+  for (const header of headers) {
+    const parts = header.split(";").map((part) => part.trim());
+    const pair = parts[0] ?? "";
+    const index = pair.indexOf("=");
+    if (index <= 0) continue;
+    const key = pair.slice(0, index).trim();
+    const value = pair.slice(index + 1).trim();
+    if (!key || value === "") continue;
+    let domain = "";
+    for (const attribute of parts.slice(1)) {
+      const separator = attribute.indexOf("=");
+      if (separator <= 0) continue;
+      if (attribute.slice(0, separator).trim().toLowerCase() !== "domain") continue;
+      domain = attribute
+        .slice(separator + 1)
+        .trim()
+        .replace(/^\./u, "")
+        .toLowerCase();
+    }
+    if (domain && (target === domain || target.endsWith(`.${domain}`))) {
+      result.set(key, value);
     }
   }
-  return serializeCookies(jar);
+  return result;
 }
 
 /** 在 Cookie 串里写入一项（已存在则覆盖）。 */

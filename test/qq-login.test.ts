@@ -67,7 +67,7 @@ describe("QQ QR login", () => {
     const seen = stubFetch([
       { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
       {
-        match: "ptqrlogin",
+        match: "/ptqrlogin",
         reply: { body: `ptuiCB('0','0','${JUMP}','0','登录成功','%E5%B0%8F%E6%98%8E')` },
       },
       {
@@ -145,7 +145,7 @@ describe("QQ QR login", () => {
     stubFetch([
       { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
       {
-        match: "ptqrlogin",
+        match: "/ptqrlogin",
         reply: { body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')` },
       },
       {
@@ -184,7 +184,7 @@ describe("QQ QR login", () => {
   it("check_sig 没给 p_skey 时停在授权前，不会发出 QQLogin", async () => {
     const seen = stubFetch([
       { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
-      { match: "ptqrlogin", reply: { body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')` } },
+      { match: "/ptqrlogin", reply: { body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')` } },
       { match: "check_sig", reply: { status: 200 } },
     ]);
 
@@ -192,23 +192,41 @@ describe("QQ QR login", () => {
     await client.createQR();
     await expect(client.checkQR()).rejects.toThrow(/p_skey/u);
     expect(seen.some((item) => item.body.includes("QQConnectLogin.LoginServer"))).toBe(false);
+    // 第一次不带 Cookie，失败后还要按浏览器方式重试一次。
+    expect(seen.filter((item) => item.url.includes("check_sig"))).toHaveLength(2);
   });
 
-  it("check_sig 要跟着跳转走，p_skey 在最后一跳才下发", async () => {
+  it("check_sig 第一次不带 Cookie；拿不到 p_skey 时用浏览器方式重试", async () => {
+    // 线上就是这样：整只扁平 Cookie jar 发过去，QQ 回 `p_skey=` 空值 + `p_skey_forbid`。
+    // 换成「先不带 Cookie，再只带 Domain 匹配的 Cookie 重试」才拿得到 p_skey。
     const seen = stubFetch([
       { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
       {
-        match: "ptqrlogin",
-        reply: { body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')` },
+        match: "/ptqrlogin",
+        reply: {
+          body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')`,
+          headers: {
+            "set-cookie":
+              "uin=o123456789; Path=/; Domain=.qq.com, skey=PT_SKEY; Path=/; Domain=.qq.com, " +
+              "host_only=1; Path=/",
+          },
+        },
       },
       {
         match: "check_sig",
         reply: ((request: Seen): Reply =>
-          request.url.includes("hop=2")
-            ? { headers: { "set-cookie": "p_skey=P_SKEY_VALUE; Domain=qq.com; Path=/" } }
-            : {
+          request.url.includes("ptredirect=100")
+            ? {
                 status: 302,
-                headers: { location: JUMP.replace("check_sig?", "check_sig?hop=2&") },
+                headers: {
+                  location: "https://graph.qq.com/oauth2.0/login_jump",
+                  "set-cookie": "p_skey=; Path=/; Domain=.qq.com, p_skey_forbid=1; Path=/; Domain=.qq.com",
+                },
+              }
+            : {
+                headers: {
+                  "set-cookie": "p_skey=P_SKEY_VALUE; Path=/; Domain=.qq.com",
+                },
               }),
       },
       {
@@ -246,9 +264,25 @@ describe("QQ QR login", () => {
     const client = new QQClient();
     await client.createQR();
     const state = await client.checkQR();
-
     expect(state.state).toBe("success");
-    expect(seen.some((item) => item.url.includes("hop=2"))).toBe(true);
+
+    const checks = seen.filter((item) => item.url.includes("check_sig"));
+    expect(checks).toHaveLength(2);
+    // 第一次：自己拼参数、不带 Cookie。
+    expect(checks[0]?.url).toContain("ptredirect=100");
+    expect(checks[0]?.cookie).toBe("");
+    // 第二次：打开 ptlogin 给的地址，只带 Domain 匹配 check_sig 主机的 Cookie。
+    expect(checks[1]?.url).toBe(JUMP);
+    expect(checks[1]?.cookie).toContain("uin=o123456789");
+    expect(checks[1]?.cookie).toContain("skey=PT_SKEY");
+    expect(checks[1]?.cookie).not.toContain("host_only");
+
+    // 授权只带 check_sig 下发的 Cookie（p_skey / p_uin / pt4_token…），
+    // 不把二维码阶段的 qrsig / pt_login_sig 带过去。
+    const oauth = seen.find((item) => item.url.includes("oauth2.0/authorize"));
+    expect(oauth?.cookie).toContain("p_skey=P_SKEY_VALUE");
+    expect(oauth?.cookie).not.toContain("qrsig");
+    expect(oauth?.cookie).not.toContain("pt_login_sig");
   });
 
   it("多个 Cookie 挤在同一个 Set-Cookie 头里时，p_skey 不能丢", async () => {
@@ -257,7 +291,7 @@ describe("QQ QR login", () => {
     const seen = stubFetch([
       { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
       {
-        match: "ptqrlogin",
+        match: "/ptqrlogin",
         reply: {
           body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')`,
           headers: {
@@ -308,13 +342,11 @@ describe("QQ QR login", () => {
     const state = await client.checkQR();
     expect(state.state).toBe("success");
 
-    const check = seen.find((item) => item.url.includes("check_sig"));
-    // 校验链要带上扫码阶段下发的 uin / skey，否则 QQ 不会下发 p_skey。
-    expect(check?.cookie).toContain("uin=o123456789");
-    expect(check?.cookie).toContain("skey=PT_SKEY");
-
+    // 同一个头里的两个 Cookie 都要认出来：p_skey 用来算 g_tk，
+    // pt_oauth_token 要跟授权请求一起发回 graph.qq.com。
     const oauth = seen.find((item) => item.url.includes("oauth2.0/authorize"));
     expect(oauth?.cookie).toContain("p_skey=P_SKEY_VALUE");
+    expect(oauth?.cookie).toContain("pt_oauth_token=oauth");
   });
 
   it("轮询回到吐出二维码的那台机器", async () => {
@@ -322,7 +354,7 @@ describe("QQ QR login", () => {
       // xui 这一路拿不到图，落到 ssl 那一路。
       { match: "xui.ptlogin2.qq.com", reply: { body: "<html>维护中</html>" } },
       { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
-      { match: "ptqrlogin", reply: { body: "ptuiCB('66','0','','0','二维码未失效。','')" } },
+      { match: "/ptqrlogin", reply: { body: "ptuiCB('66','0','','0','二维码未失效。','')" } },
     ]);
 
     const first = new QQClient();

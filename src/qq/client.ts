@@ -18,7 +18,16 @@
  * 只要求 `code === 0`，字段映射在 `api.ts` 里做多路兼容。
  */
 
-import { mergeCookies, parseCookies, platformFetch, cookieValue, setCookies } from "../shared/http";
+import {
+  applySetCookieLines,
+  cookiesForHost,
+  cookieValue,
+  mergeCookies,
+  parseCookies,
+  platformFetch,
+  serializeCookies,
+  setCookies,
+} from "../shared/http";
 import { unavailable } from "../shared/errors";
 import { imageDataUrl, sniffImageMime } from "../shared/image";
 
@@ -267,6 +276,8 @@ export class QQClient {
       },
       redirect: "manual",
     });
+    // 这一跳下发的 Cookie 要按域名挑：扫码成功后 `check_sig` 只该收到浏览器会带过去的那部分。
+    const loginSetCookies = setCookies(response);
     this.cookie = mergeCookies(this.cookie, response);
     const body = await response.text();
     const parsed = parsePtuiCB(body);
@@ -282,7 +293,7 @@ export class QQClient {
     if (parsed.code !== "0" || !parsed.url) {
       return { state: "waiting" };
     }
-    const credential = await this.followLogin(parsed.url);
+    const credential = await this.followLogin(parsed.url, loginSetCookies);
     const uin = cookieValue(credential, "uin").replace(/^o/u, "");
     return {
       state: "success",
@@ -304,15 +315,15 @@ export class QQClient {
    * 之前这里只是跟着 302 抓网页版 Cookie，`uin` 是空的，数据接口全部返回
    * `500003`（未登录）/ `1000`（凭据过期）——这就是「QQ 显示已登录但什么都拿不到」。
    */
-  private async followLogin(jumpUrl: string): Promise<string> {
-    const code = await this.authorize(jumpUrl);
+  private async followLogin(jumpUrl: string, loginSetCookies: string[]): Promise<string> {
+    const code = await this.authorize(jumpUrl, loginSetCookies);
     const device = newDevice();
     const data = await this.qqLogin(code, device);
     return credentialCookies(data, device);
   }
 
   /** check_sig → graph.qq.com/oauth2.0/authorize → `code`。 */
-  private async authorize(jumpUrl: string): Promise<string> {
+  private async authorize(jumpUrl: string, loginSetCookies: string[]): Promise<string> {
     const jump = new URL(jumpUrl);
     // 跳转地址由 QQ 自己给出，但 Worker 会真的去请求它；限定 https + qq.com。
     if (jump.protocol !== "https:" || !isQQHost(jump.hostname)) {
@@ -322,7 +333,7 @@ export class QQClient {
       throw unavailable("QQ 登录跳转缺少 uin 或 ptsigx");
     }
 
-    const pSkey = await this.checkSig(jump);
+    const { pSkey, cookies: sigCookies } = await this.checkSig(jump, loginSetCookies);
 
     const ui = crypto.randomUUID().replace(/-/gu, "").toUpperCase();
     const body = new URLSearchParams({
@@ -341,13 +352,17 @@ export class QQClient {
       auth_time: String(Date.now()),
       ui,
     });
+    // 授权只用 check_sig 下发的那套 Cookie（p_skey / p_uin / pt4_token…），
+    // 和浏览器在这一步的行为一致；二维码阶段的 Cookie 不带过去。
+    const graphCookies = new Map(sigCookies);
+    graphCookies.set("ui", ui);
     const response = await platformFetch(GRAPH_AUTHORIZE, {
       method: "POST",
       headers: {
         Origin: "https://graph.qq.com",
         Referer: this.endpoint.referer,
         "Content-Type": "application/x-www-form-urlencoded",
-        Cookie: `${this.cookie}; ui=${ui}`,
+        Cookie: serializeCookies(graphCookies),
         Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
         "User-Agent": LOGIN_UA,
         "Accept-Language": LOGIN_LANGUAGE,
@@ -366,67 +381,104 @@ export class QQClient {
   }
 
   /**
-   * 走 `check_sig` 校验链，取回 `p_skey`。
+   * 走 `check_sig` 换回 `p_skey`。
    *
-   * 这一步**不是一次请求**：QQ 的校验链每跳一次换一次 `ptsig`，`p_skey` 要到最后
-   * 跳才下发。第一跳只回 302（Location 指向下一跳），不跟就永远拿不到 `p_skey`
-   * ——表现出来就是「扫码成功了却登录失败」。
+   * 线上验证过的做法是两次尝试：
    *
-   * 边界：只跟 `ptlogin2.graph.qq.com` 这一台的跳转。跳出这一台的下一跳就是
-   * 授权回跳（地址里带一次性 code），不能去打开，否则 code 会进日志。
+   *   1. 自己拼参数、**不带 Cookie** 请求 check_sig（qqmusic-api-python 的方式）；
+   *   2. 没拿到 `p_skey` 时按浏览器的方式重试一次：打开 ptlogin 给出的原始地址，
+   *      只带扫码成功响应里、域名匹配 check_sig 主机的 Cookie。
+   *
+   * 直接把整只扁平 Cookie jar 发过去，QQ 会回 `p_skey=`（空）并下发
+   * `p_skey_forbid`，表现就是「扫码成功却登录失败」。
+   *
+   * 返回值除了 `p_skey`，还有这一跳下发的全部 Cookie——授权那一步要用它们。
    */
-  private async checkSig(jump: URL): Promise<string> {
-    const trace: string[] = [];
-    let current = jump;
-    for (let hop = 0; hop < 4; hop += 1) {
-      const response = await platformFetch(current.toString(), {
-        headers: {
-          Referer: this.endpoint.referer,
-          Cookie: this.cookie,
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "User-Agent": LOGIN_UA,
-          "Accept-Language": LOGIN_LANGUAGE,
-          "Upgrade-Insecure-Requests": "1",
-        },
-        redirect: "manual",
-      });
-      this.cookie = mergeCookies(this.cookie, response);
-      await response.arrayBuffer().catch(() => undefined);
+  private async checkSig(
+    jump: URL,
+    loginSetCookies: string[],
+  ): Promise<{ pSkey: string; cookies: Map<string, string> }> {
+    const url = new URL("https://ssl.ptlogin2.graph.qq.com/check_sig");
+    url.search = new URLSearchParams({
+      uin: jump.searchParams.get("uin") ?? "",
+      pttype: "1",
+      service: "ptqrlogin",
+      nodirect: "0",
+      ptsigx: jump.searchParams.get("ptsigx") ?? "",
+      s_url: LOGIN_JUMP,
+      ptlang: "2052",
+      ptredirect: "100",
+      aid: APPID,
+      daid: DAID,
+      j_later: "0",
+      low_login_hour: "0",
+      regmaster: "0",
+      pt_login_type: "3",
+      pt_aid: "0",
+      pt_aaid: "16",
+      pt_light: "0",
+      pt_3rd_aid: PT_3RD_AID,
+    }).toString();
 
-      const location = response.headers.get("location");
-      const cookieNames = [...parseCookies(this.cookie).keys()].sort().join(",") || "none";
-      let redirectHost = "none";
-      if (location) {
-        try {
-          redirectHost = new URL(location, current).host;
-        } catch {
-          redirectHost = "invalid";
-        }
-      }
-      // 只记 Cookie **名字**，不记值：排查「p_skey 到底有没有下发」够用了。
-      trace.push(
-        `${current.host}${current.pathname}[${[...current.searchParams.keys()].join(",")}] → ${response.status}` +
-          `${location ? ` 跳转 ${redirectHost}` : ""}（cookies=${cookieNames}）`,
-      );
-
-      const pSkey = ["p_skey", "p_sKey", "skey", "pskey"]
-        .map((key) => cookieValue(this.cookie, key))
-        .find((value) => value !== "");
-      if (pSkey) {
-        return pSkey;
-      }
-      if (!location) {
-        break;
-      }
-      const next = new URL(location, current);
-      // 只在 check_sig 这一台的两种写法之间跳（ssl.ptlogin2.graph.qq.com 与
-      // ptlogin2.graph.qq.com 会互跳）；跳出这一台就是授权回跳，不能去打开。
-      if (next.protocol !== "https:" || !isCheckSigHost(next.hostname)) {
-        break;
-      }
-      current = next;
+    const attempts: string[] = [];
+    let cookies = await this.requestCheckSig(url.toString(), "", attempts);
+    let pSkey = pickPSkey(cookies);
+    if (!pSkey) {
+      // 浏览器不会把 ptlogin 的主机独占 Cookie 带去 check_sig，只带 Domain 匹配的那些。
+      const browserCookies = cookiesForHost(loginSetCookies, jump.hostname);
+      cookies = await this.requestCheckSig(jump.toString(), serializeCookies(browserCookies), attempts);
+      pSkey = pickPSkey(cookies);
     }
-    throw unavailable(`QQ 会话校验未返回 p_skey（${trace.join(" / ")}）`);
+
+    // check_sig 下发的 Cookie 留在 jar 里，供后续排查 / 授权使用。
+    const jar = applySetCookieLines(parseCookies(this.cookie), [...cookies].map(([key, value]) => `${key}=${value}`));
+    this.cookie = serializeCookies(jar);
+
+    if (!pSkey) {
+      // 只记状态码、跳转的域名与路径、Cookie 名字——参数与值都可能带凭据。
+      throw unavailable(`QQ 会话校验未返回 p_skey（${attempts.join("；重试：")}）`);
+    }
+    return { pSkey, cookies };
+  }
+
+  /** 请求一次 check_sig；`cookieHeader` 为空表示不带 Cookie。 */
+  private async requestCheckSig(
+    url: string,
+    cookieHeader: string,
+    attempts: string[],
+  ): Promise<Map<string, string>> {
+    const response = await platformFetch(url, {
+      headers: {
+        Referer: "https://xui.ptlogin2.qq.com/",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/*,*/*;q=0.8",
+        "User-Agent": LOGIN_UA,
+        "Accept-Language": LOGIN_LANGUAGE,
+        "Upgrade-Insecure-Requests": "1",
+      },
+      redirect: "manual",
+    });
+    const lines = setCookies(response);
+    await response.arrayBuffer().catch(() => undefined);
+
+    const location = response.headers.get("location");
+    let redirect = "";
+    if (location) {
+      try {
+        const next = new URL(location, url);
+        redirect = ` 跳转 ${next.host}${next.pathname}`;
+      } catch {
+        redirect = " 跳转 无效地址";
+      }
+    }
+    const names = lines
+      .map((line) => (line.split(";")[0] ?? "").split("=")[0]?.trim() ?? "")
+      .filter((name) => name !== "")
+      .sort()
+      .join(",");
+    attempts.push(`HTTP ${response.status}${redirect}（下发 ${names || "无 Cookie"}）`);
+
+    return applySetCookieLines(new Map(), lines);
   }
 
   /** `QQConnectLogin.LoginServer/QQLogin`：用一次性 code 换 musickey。 */
@@ -695,10 +747,15 @@ function isQQHost(hostname: string): boolean {
   return host === "qq.com" || host.endsWith(".qq.com");
 }
 
-/** check_sig 校验链所在的主机（`ssl.` 前缀会被 QQ 换掉）。 */
-function isCheckSigHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-  return host === "ptlogin2.graph.qq.com" || host.endsWith(".ptlogin2.graph.qq.com");
+/** QQ 在不同版本里用过这几种写法；取第一个非空值。 */
+function pickPSkey(cookies: Map<string, string>): string {
+  for (const key of ["p_skey", "p_sKey", "skey", "pskey"]) {
+    const value = cookies.get(key) ?? "";
+    if (value !== "") {
+      return value;
+    }
+  }
+  return "";
 }
 
 /**

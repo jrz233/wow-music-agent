@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { hash33, parsePtuiCB } from "../src/qq/client";
 import { mapPlaylist as mapQQPlaylist, mapTrack as mapQQTrack } from "../src/qq/api";
 import { mapPlaylist as mapNeteasePlaylist, mapTrack as mapNeteaseTrack } from "../src/netease/api";
-import { mergeCookies, parseCookies } from "../src/shared/http";
+import { cookiesForHost, mergeCookies, parseCookies } from "../src/shared/http";
 
 describe("QQ login helpers", () => {
   it("computes hash33 like ptlogin", () => {
@@ -39,6 +39,28 @@ describe("cookie handling", () => {
     expect(jar.get("a")).toBe("1");
     expect(jar.get("b")).toBe("2");
     expect(jar.get("c")).toBe("3");
+  });
+
+  it("空值不覆盖已有的非空值", () => {
+    // QQ 登录链会用 `p_skey=; Max-Age=0` 清旧值，随后才下发真值；反过来也可能。
+    // 空值把刚拿到的 p_skey 抹掉，就是「扫码成功但没拿到 p_skey」。
+    const response = new Response(null, {
+      headers: [["set-cookie", "p_skey=; Max-Age=0; Path=/"]],
+    });
+    expect(parseCookies(mergeCookies("p_skey=REAL", response)).get("p_skey")).toBe("REAL");
+  });
+
+  it("只挑浏览器会带去目标主机的 Cookie（Domain 匹配）", () => {
+    const lines = [
+      "uin=o123; Path=/; Domain=.qq.com",
+      "skey=abc; Domain=qq.com; Path=/",
+      "host_only=1; Path=/",
+      "other=2; Domain=.example.com",
+      "empty=; Domain=.qq.com",
+    ];
+    const cookies = cookiesForHost(lines, "ssl.ptlogin2.graph.qq.com");
+    expect([...cookies.keys()].sort()).toEqual(["skey", "uin"]);
+    expect(cookiesForHost(lines, "example.com").get("other")).toBe("2");
   });
 });
 
