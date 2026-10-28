@@ -251,6 +251,72 @@ describe("QQ QR login", () => {
     expect(seen.some((item) => item.url.includes("hop=2"))).toBe(true);
   });
 
+  it("多个 Cookie 挤在同一个 Set-Cookie 头里时，p_skey 不能丢", async () => {
+    // 线上 QQ 就是这么回的：一个 Set-Cookie 头里用逗号塞了两个 Cookie，
+    // 而 Expires 日期里也有逗号。只按 `;` 取第一段会丢掉后面的 p_skey。
+    const seen = stubFetch([
+      { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
+      {
+        match: "ptqrlogin",
+        reply: {
+          body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')`,
+          headers: {
+            "set-cookie": "uin=o123456789; Path=/; Domain=.qq.com, skey=PT_SKEY; Path=/; Domain=.qq.com",
+          },
+        },
+      },
+      {
+        match: "check_sig",
+        reply: {
+          status: 302,
+          headers: {
+            location: "https://graph.qq.com/oauth2.0/login_jump",
+            "set-cookie":
+              "pt_oauth_token=oauth; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/, p_skey=P_SKEY_VALUE; Path=/",
+          },
+        },
+      },
+      {
+        match: "graph.qq.com/oauth2.0/authorize",
+        reply: {
+          status: 302,
+          headers: { location: "https://y.qq.com/portal/wx_redirect.html?code=ONE_TIME_CODE&state=x" },
+        },
+      },
+      {
+        match: "music.getSession.session",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: { code: 0, data: { session: { uid: "1", sid: "2" } } },
+          }),
+        },
+      },
+      {
+        match: "QQConnectLogin.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: { code: 0, data: { str_musicid: "123456789", musickey: "MUSIC_KEY_VALUE" } },
+          }),
+        },
+      },
+    ]);
+
+    const client = new QQClient();
+    await client.createQR();
+    const state = await client.checkQR();
+    expect(state.state).toBe("success");
+
+    const check = seen.find((item) => item.url.includes("check_sig"));
+    // 校验链要带上扫码阶段下发的 uin / skey，否则 QQ 不会下发 p_skey。
+    expect(check?.cookie).toContain("uin=o123456789");
+    expect(check?.cookie).toContain("skey=PT_SKEY");
+
+    const oauth = seen.find((item) => item.url.includes("oauth2.0/authorize"));
+    expect(oauth?.cookie).toContain("p_skey=P_SKEY_VALUE");
+  });
+
   it("轮询回到吐出二维码的那台机器", async () => {
     const seen = stubFetch([
       // xui 这一路拿不到图，落到 ssl 那一路。

@@ -394,8 +394,19 @@ export class QQClient {
       await response.arrayBuffer().catch(() => undefined);
 
       const location = response.headers.get("location");
+      const cookieNames = [...parseCookies(this.cookie).keys()].sort().join(",") || "none";
+      let redirectHost = "none";
+      if (location) {
+        try {
+          redirectHost = new URL(location, current).host;
+        } catch {
+          redirectHost = "invalid";
+        }
+      }
+      // 只记 Cookie **名字**，不记值：排查「p_skey 到底有没有下发」够用了。
       trace.push(
-        `${current.host}${current.pathname}[${[...current.searchParams.keys()].join(",")}] → ${response.status}${location ? " 跳转" : ""}`,
+        `${current.host}${current.pathname}[${[...current.searchParams.keys()].join(",")}] → ${response.status}` +
+          `${location ? ` 跳转 ${redirectHost}` : ""}（cookies=${cookieNames}）`,
       );
 
       const pSkey = ["p_skey", "p_sKey", "skey", "pskey"]

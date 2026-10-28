@@ -65,14 +65,31 @@ export async function fetchJSON<T>(url: string, options: FetchOptions = {}): Pro
   }
 }
 
-/** 解析 `Set-Cookie`。Workers 支持 `getSetCookie()`；测试环境的 undici 也支持。 */
+/**
+ * 解析 `Set-Cookie`。Workers 支持 `getSetCookie()`；测试环境的 undici 也支持。
+ *
+ * 光有 `getSetCookie()` 还不够：QQ 登录链会把**多个 Cookie 塞进同一个头**里（例如
+ * `pt_oauth_token=…; Expires=…, p_skey=…; Path=/`），此时 `getSetCookie()` 原样返回
+ * 这一整条，按 `;` 取第一个就只拿到前一个 Cookie，后面的 `p_skey` 直接丢掉——表现
+ * 就是「扫码成功了，但会话校验拿不到 p_skey」。
+ *
+ * 逗号既可能是 `Expires=Wed, 21 Oct …` 里的日期分隔，也可能是两个 Cookie 的分隔，
+ * 所以只在逗号后面紧跟 `name=` 时才切（与 wow-origin 的处理一致）。
+ */
+function splitSetCookie(header: string): string[] {
+  return header
+    .split(/,(?=\s*[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/u)
+    .map((item) => item.trim())
+    .filter((item) => item !== "");
+}
+
 export function setCookies(response: Response): string[] {
   const headers = response.headers as Headers & { getSetCookie?: () => string[] };
-  if (typeof headers.getSetCookie === "function") {
-    return headers.getSetCookie();
-  }
-  const single = response.headers.get("set-cookie");
-  return single ? [single] : [];
+  const values =
+    typeof headers.getSetCookie === "function"
+      ? headers.getSetCookie()
+      : [response.headers.get("set-cookie") ?? ""];
+  return values.flatMap(splitSetCookie);
 }
 
 /** 把 `Set-Cookie` 的键值对合并进一个 `k=v; k=v` 字符串。 */
