@@ -11,14 +11,49 @@
 
 import { mergeCookies, parseCookies, platformFetch, cookieValue, setCookies } from "../shared/http";
 import { unavailable } from "../shared/errors";
+import { imageDataUrl, sniffImageMime } from "../shared/image";
 
-const PTLOGIN = "https://ssl.ptlogin2.qq.com";
 const LOGIN_JUMP = "https://graph.qq.com/oauth2.0/login_jump";
 const MUSICU = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const REFERER = "https://y.qq.com/";
 const APPID = "716027609";
 const DAID = "383";
 const PT_3RD_AID = "100497308";
+
+/**
+ * ptlogin 的两个入口。
+ *
+ * 主机与路径必须配对：`ssl.ptlogin2.qq.com` 配 `/ptqrshow`，`xui.ptlogin2.qq.com`
+ * 配 `/ssl/ptqrshow`，交叉搭配会 302 到别处去（拿不到图）。
+ *
+ * 两个入口返回的都是 PNG，但**都不带 content-type 头**，只能靠魔数识别。
+ * `xui` 这一路先访问一次 `/cgi-bin/xlogin`，它会下发 `pt_login_sig`、`uikey` 等
+ * Cookie；轮询 `ptqrlogin` 时要带上 `pt_login_sig`，缺失会影响扫码成功后的换票。
+ */
+interface QQEndpoint {
+  base: string;
+  show: string;
+  poll: string;
+  referer: string;
+  needsXLogin: boolean;
+}
+
+const QQ_ENDPOINTS: QQEndpoint[] = [
+  {
+    base: "https://xui.ptlogin2.qq.com",
+    show: "/ssl/ptqrshow",
+    poll: "/ssl/ptqrlogin",
+    referer: "https://xui.ptlogin2.qq.com/cgi-bin/xlogin",
+    needsXLogin: true,
+  },
+  {
+    base: "https://ssl.ptlogin2.qq.com",
+    show: "/ptqrshow",
+    poll: "/ptqrlogin",
+    referer: "https://y.qq.com/",
+    needsXLogin: false,
+  },
+];
 
 const MUSIC_HEADERS = {
   "Content-Type": "application/json",
@@ -45,9 +80,12 @@ export type QQLoginState = QQConflict | { state: "success"; result: QQLoginResul
 
 export class QQClient {
   cookie: string;
+  /** 真正吐出二维码的那个入口；轮询必须回到同一台机器，否则 qrsig 对不上。 */
+  private endpoint: QQEndpoint;
 
   constructor(cookie = "") {
     this.cookie = cookie;
+    this.endpoint = QQ_ENDPOINTS[0] as QQEndpoint;
   }
 
   get uin(): string {
@@ -57,7 +95,12 @@ export class QQClient {
     return raw.replace(/^o/u, "");
   }
 
-  /** 二维码图片 + qrsig Cookie。 */
+  /**
+   * 二维码图片 + qrsig Cookie。
+   *
+   * ptqrshow 回的 PNG **不带 content-type 头**，所以这里只认魔数；
+   * 拿不到图就换另一个入口（主机与路径要配对，见 QQ_ENDPOINTS）。
+   */
   async createQR(): Promise<{ imageDataUrl: string; cookie: string }> {
     const query = new URLSearchParams({
       appid: APPID,
@@ -71,20 +114,55 @@ export class QQClient {
       pt_3rd_aid: PT_3RD_AID,
       u1: LOGIN_JUMP,
     });
-    const response = await platformFetch(`${PTLOGIN}/ptqrshow?${query.toString()}`, {
-      headers: { Referer: REFERER, Accept: "image/*" },
+    let failure: Error | null = null;
+    for (const endpoint of QQ_ENDPOINTS) {
+      try {
+        if (endpoint.needsXLogin) {
+          await this.xlogin(endpoint);
+        }
+        const response = await platformFetch(`${endpoint.base}${endpoint.show}?${query.toString()}`, {
+          headers: { Referer: endpoint.referer, Accept: "image/*" },
+          redirect: "manual",
+        });
+        this.cookie = mergeCookies(this.cookie, response);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const mime = sniffImageMime(bytes);
+        if (!response.ok || !mime) {
+          failure = unavailable("QQ 二维码获取失败");
+          continue;
+        }
+        if (!cookieValue(this.cookie, "qrsig")) {
+          failure = unavailable("QQ 二维码响应缺少 qrsig");
+          continue;
+        }
+        this.endpoint = endpoint;
+        return { imageDataUrl: imageDataUrl(bytes, mime), cookie: this.cookie };
+      } catch (error) {
+        failure = error as Error;
+      }
+    }
+    throw failure ?? unavailable("QQ 二维码获取失败");
+  }
+
+  /** 访问一次登录页，拿到 `pt_login_sig` / `uikey` 等 Cookie。 */
+  private async xlogin(endpoint: QQEndpoint): Promise<void> {
+    const url = new URL("/cgi-bin/xlogin", endpoint.base);
+    url.search = new URLSearchParams({
+      appid: APPID,
+      daid: DAID,
+      style: "33",
+      hide_title_bar: "1",
+      hide_border: "1",
+      target: "self",
+      s_url: LOGIN_JUMP,
+      pt_3rd_aid: PT_3RD_AID,
+    }).toString();
+    const response = await platformFetch(url.toString(), {
+      headers: { Referer: `${endpoint.base}/`, Accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
       redirect: "manual",
     });
     this.cookie = mergeCookies(this.cookie, response);
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!response.ok || !contentType.startsWith("image/")) {
-      throw unavailable("QQ 二维码获取失败");
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    return {
-      imageDataUrl: `data:${contentType.split(";")[0]};base64,${base64(bytes)}`,
-      cookie: this.cookie,
-    };
+    await response.arrayBuffer().catch(() => undefined);
   }
 
   /** 轮询扫码状态。成功时返回登录后的 Cookie 与账号信息。 */
@@ -103,7 +181,7 @@ export class QQClient {
       from_ui: "1",
       ptlang: "2052",
       action: `0-0-${Date.now()}`,
-      js_ver: "10233",
+      js_ver: "25100115",
       js_type: "1",
       login_sig: cookieValue(this.cookie, "pt_login_sig"),
       pt_uistyle: "40",
@@ -111,8 +189,8 @@ export class QQClient {
       daid: DAID,
       pt_3rd_aid: PT_3RD_AID,
     });
-    const response = await platformFetch(`${PTLOGIN}/ptqrlogin?${query.toString()}`, {
-      headers: { Referer: REFERER, Cookie: this.cookie },
+    const response = await platformFetch(`${this.endpoint.base}${this.endpoint.poll}?${query.toString()}`, {
+      headers: { Referer: this.endpoint.referer, Cookie: this.cookie, Accept: "*/*" },
       redirect: "manual",
     });
     this.cookie = mergeCookies(this.cookie, response);
@@ -263,12 +341,4 @@ export function cookiesFrom(response: Response): string[] {
 
 export function cookieJar(raw: string): Map<string, string> {
   return parseCookies(raw);
-}
-
-function base64(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
 }

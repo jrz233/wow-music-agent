@@ -7,6 +7,7 @@
 
 import { mergeCookies, parseCookies, platformFetch } from "../shared/http";
 import { unavailable } from "../shared/errors";
+import { imageDataUrl, sniffImageMime } from "../shared/image";
 import { weapi } from "./crypto";
 
 const MUSIC_BASE = "https://music.163.com";
@@ -77,15 +78,51 @@ export class NeteaseClient {
     if (!key) {
       throw unavailable("网易云没有返回二维码 key");
     }
-    const image = await platformFetch(`${MUSIC_BASE}/login?codekey=${encodeURIComponent(key)}`, {
-      headers: { Referer: REFERER, Accept: "image/*" },
+    return { key, imageDataUrl: await this.fetchQRImage(key) };
+  }
+
+  /**
+   * 取二维码图片。
+   *
+   * 旧做法是直接 GET `login?codekey=…` 指望它回一张 PNG——现在那个地址回的是
+   * 网页版登录页的 HTML，二维码自然永远显示不出来。网页版自己也是先向
+   * `/api/web/qrcode/get` 要一张渲染好的图，再去 CDN 取。
+   *
+   * 这里由 Worker 代取并内联成 data URL：既不把用户 IP 暴露给图片 CDN，
+   * 管理页的 CSP 也不用为 `music.163.com` 开口子。
+   */
+  private async fetchQRImage(key: string): Promise<string> {
+    const pageURL = `${MUSIC_BASE}/login?codekey=${encodeURIComponent(key)}`;
+    const response = await platformFetch(`${MUSIC_BASE}/api/web/qrcode/get`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Referer: REFERER,
+      },
+      body: new URLSearchParams({ url: pageURL, size: "180" }).toString(),
     });
-    const contentType = image.headers.get("content-type") ?? "";
-    if (!image.ok || !contentType.startsWith("image/")) {
+    if (!response.ok) {
       throw unavailable("网易云二维码获取失败");
     }
+    let payload: Record<string, unknown>;
+    try {
+      payload = (await response.json()) as Record<string, unknown>;
+    } catch {
+      throw unavailable("网易云二维码获取失败");
+    }
+    const imageURL = String(payload.qrcodeImageUrl ?? "");
+    if (!isNeteaseImageURL(imageURL)) {
+      throw unavailable("网易云二维码获取失败");
+    }
+    const image = await platformFetch(imageURL, {
+      headers: { Referer: REFERER, Accept: "image/*" },
+    });
     const bytes = new Uint8Array(await image.arrayBuffer());
-    return { key, imageDataUrl: `data:${contentType.split(";")[0]};base64,${base64(bytes)}` };
+    const mime = sniffImageMime(bytes);
+    if (!image.ok || !mime) {
+      throw unavailable("网易云二维码获取失败");
+    }
+    return imageDataUrl(bytes, mime);
   }
 
   async checkQR(key: string): Promise<QRState> {
@@ -132,10 +169,25 @@ export class NeteaseClient {
   }
 }
 
-function base64(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
+/**
+ * 只允许取网易云自家域名下的图片。
+ *
+ * URL 由网易云返回、不是用户给的，风险本来就低；但 Worker 会真的去请求它，
+ * 顺手把范围收窄到网易云的域名，免得哪天上游回了个内网地址就被我们照着打。
+ */
+function isNeteaseImageURL(raw: string): boolean {
+  if (!raw.startsWith("https://")) {
+    return false;
   }
-  return btoa(binary);
+  let host: string;
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    host === "music.163.com" ||
+    host.endsWith(".music.163.com") ||
+    host.endsWith(".126.net")
+  );
 }
