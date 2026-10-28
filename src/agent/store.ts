@@ -449,15 +449,27 @@ export class AgentStore {
 
   // ---- nonce / 清理 ---------------------------------------------------------
 
-  /** 插入并检查是否首次使用；返回 false 表示重放。 */
+  /**
+   * 插入并检查是否首次使用；返回 false 表示重放。
+   *
+   * **不要用 `cursor.rowsWritten === 1` 判断**：DO SQLite 的 `rowsWritten` 统计的是
+   * 所有被写入的 B 树行，`PRIMARY KEY (scope, nonce)` 的隐式索引也算一行，所以一次
+   * 成功插入这里恒为 2。那个写法会让**每个首次请求都被判成重放**，表现为 Agent
+   * 永远 401、面板永远离线，而 Server 侧只看到「请求失败」。
+   *
+   * 改用 `RETURNING`：只在真正插入时返回一行，冲突被 `IGNORE` 掉时零行。
+   */
   useNonce(scope: string, nonce: string, expiresAt: number): boolean {
-    const cursor = this.sql.exec(
-      "INSERT OR IGNORE INTO nonces (scope, nonce, expires_at) VALUES (?, ?, ?)",
-      scope,
-      nonce,
-      expiresAt,
-    );
-    return cursor.rowsWritten === 1;
+    const inserted = this.sql
+      .exec(
+        `INSERT OR IGNORE INTO nonces (scope, nonce, expires_at) VALUES (?, ?, ?)
+         RETURNING scope`,
+        scope,
+        nonce,
+        expiresAt,
+      )
+      .toArray();
+    return inserted.length === 1;
   }
 
   cleanup(now: number): void {
