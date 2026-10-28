@@ -40,7 +40,8 @@ npx wrangler login
 npx wrangler deploy
 ```
 
-部署输出会给出 `https://wow-music-agent.<你的子域>.workers.dev`。管理页在 `/admin`。
+部署输出会给出 `https://wow-music-agent.<你的子域>.workers.dev`。直接打开这个地址就是
+管理页（`/` 会跳到 `/admin`，不需要手打路径）。
 
 > **建议 Workers Paid。** 免费版每次请求只有 10ms CPU，扫码轮询与 weapi 加密可能超时；
 > 免费版仍能运行，但失败率更高。Durable Object 需要 SQLite-backed class（配置已包含）。
@@ -56,7 +57,7 @@ wow-server 只接受 **https + 443 + 根路径** 的 Agent 地址，自定义域
 
 ### 1. 连接 wow-server
 
-1. 打开 `https://<worker>/admin`，填入你的 wow-server 地址（只填到域名，例如
+1. 打开 `https://<worker>/`，填入你的 wow-server 地址（只填到域名，例如
    `https://music.example.com`），点 **登录**。
 2. 浏览器跳到 wow-server 的授权页。用**你已有的本站账号**登录（没登录会先跳登录页）。
 3. 核对页面上显示的 Agent 地址与公钥指纹，点 **允许授权**。
@@ -98,7 +99,7 @@ wow-server 只接受 **https + 443 + 根路径** 的 Agent 地址，自定义域
 
 ```bash
 npm ci
-npm run dev        # http://localhost:8787/admin
+npm run dev        # http://localhost:8787/
 ```
 
 本地完全不需要 `.dev.vars`。

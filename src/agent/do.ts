@@ -48,6 +48,15 @@ export class AgentDurableObject extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // 根路径直接进管理页：用户部署完只记得「打开这个域名」，多记一个 `/admin`
+    // 只是多一条会写错的路。`/` 只做 302，不渲染任何内容。
+    if (url.pathname === "/") {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "/admin", "Cache-Control": "no-store" },
+      });
+    }
+
     // `/oauth/callback` 是 wow-server 的授权回跳，必须绕过管理会话（此时还没登录）。
     if (
       url.pathname !== "/admin" &&
