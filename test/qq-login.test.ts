@@ -381,10 +381,30 @@ describe("QQ data calls", () => {
     await client.call("music.musicasset.PlaylistBaseRead", "GetPlaylistByUin", { uin: "123456789" });
 
     const cookie = seen[0]?.cookie ?? "";
-    expect(cookie).toContain("uin=123456789");
+    // musicu 用网页版 Cookie 约定：`uin` 必须带 `o` 前缀，否则 login_uin 是 0，
+    // 歌单详情这类需要登录态的模块会回 -100006。
+    expect(cookie).toContain("uin=o123456789");
     expect(cookie).toContain("qm_keyst=KEY");
     expect(cookie).not.toContain("qrsig");
     expect(cookie).not.toContain("pt_login_sig");
+  });
+
+  it("data.code 非 0 时不能当成空数据", async () => {
+    stubFetch([
+      {
+        match: "musicu.fcg",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: { code: 0, data: { code: -100006, msg: "get diss info from tmem error", songlist: [] } },
+          }),
+        },
+      },
+    ]);
+    const client = new QQClient("uin=123456789; qm_keyst=KEY");
+    await expect(
+      client.call("music.srfDissInfo.DissInfo", "CgiGetDiss", { disstid: 201 }),
+    ).rejects.toThrow("-100006");
   });
 
   it("uin 只认纯数字；空 uin 不会伪装成已登录", () => {

@@ -67,7 +67,7 @@ describe("fetchDaily", () => {
           ],
         };
       }
-      if (call.method === "uniform_get_Dissinfo") {
+      if (call.method === "CgiGetDiss") {
         return { dirinfo: { id: "222", title: "每日30首" }, songlist: [SONG] };
       }
       return new Error("unexpected");
@@ -79,9 +79,57 @@ describe("fetchDaily", () => {
     expect(calls[0]?.module).toBe("music.recommend.RecommendFeed");
     expect(calls[0]?.method).toBe("get_recommend_feed");
     // 第二次调用用的是卡片里拿到的歌单 id，不是把卡片当曲目硬解。
-    expect(calls[1]?.module).toBe("music.srfDissInfo.aiDissInfo");
-    expect(calls[1]?.method).toBe("uniform_get_Dissinfo");
-    expect(calls[1]?.param.disstid).toBe("222");
+    // 歌单详情优先走 CgiGetDiss：uniform_get_Dissinfo 对当前客户端会回 10006。
+    expect(calls[1]?.module).toBe("music.srfDissInfo.DissInfo");
+    expect(calls[1]?.method).toBe("CgiGetDiss");
+    expect(calls[1]?.param.disstid).toBe(222);
+    expect(tracks.map((track) => track.id)).toEqual(["song1"]);
+  });
+
+  it("「每日30首」是排行榜 id 时改用 ToplistInfoServer 拉曲目", async () => {
+    // 线上实际形态：两个歌单模块对这张卡片的 id 都回 10006。
+    const calls = stubMusicu((call) => {
+      if (call.method === "get_recommend_feed") {
+        return { v_shelf: [{ v_niche: [{ v_card: [{ title: "每日30首", id: "202" }] }] }] };
+      }
+      if (call.method === "CgiGetDiss" || call.method === "uniform_get_Dissinfo") {
+        return new Error("10006");
+      }
+      if (call.method === "GetDetail") {
+        return { data: { topId: 202, title: "每日30首", totalNum: 30 }, songInfoList: [SONG] };
+      }
+      return new Error("unexpected");
+    });
+
+    const tracks = await fetchDaily(new QQClient("uin=12345; qm_keyst=k"), 10);
+
+    expect(calls.map((call) => call.method)).toEqual([
+      "get_recommend_feed",
+      "CgiGetDiss",
+      "uniform_get_Dissinfo",
+      "GetDetail",
+    ]);
+    expect(calls[2]?.module).toBe("music.srfDissInfo.aiDissInfo");
+    expect(calls[3]?.module).toBe("musicToplist.ToplistInfoServer");
+    expect(calls[3]?.param.topid).toBe(202);
+    expect(tracks.map((track) => track.id)).toEqual(["song1"]);
+  });
+
+  it("CgiGetDiss 不可用时回退 uniform_get_Dissinfo", async () => {
+    stubMusicu((call) => {
+      if (call.method === "get_recommend_feed") {
+        return { v_shelf: [{ v_niche: [{ v_card: [{ title: "每日30首", id: "222" }] }] }] };
+      }
+      if (call.method === "CgiGetDiss") {
+        return new Error("10006");
+      }
+      if (call.method === "uniform_get_Dissinfo") {
+        return { dirinfo: { id: "222", title: "每日30首" }, songlist: [SONG] };
+      }
+      return new Error("unexpected");
+    });
+
+    const tracks = await fetchDaily(new QQClient("uin=12345; qm_keyst=k"), 10);
     expect(tracks.map((track) => track.id)).toEqual(["song1"]);
   });
 
@@ -148,5 +196,54 @@ describe("fetchRoam", () => {
     expect(calls[0]?.param).not.toHaveProperty("song_num");
     expect(calls[0]?.param).not.toHaveProperty("play_flag");
     expect(tracks.map((track) => track.id)).toEqual(["song1"]);
+  });
+
+  it("熟悉口味把「我喜欢」里的歌手排到前面，尝鲜反过来", async () => {
+    const familiarSong = {
+      mid: "known",
+      name: "常听的歌",
+      singer: [{ mid: "known-artist", name: "熟悉歌手" }],
+      interval: 200,
+    };
+    const freshSong = {
+      mid: "unknown",
+      name: "陌生的歌",
+      singer: [{ mid: "other-artist", name: "陌生歌手" }],
+      interval: 200,
+    };
+    const stub = () =>
+      stubMusicu((call) => {
+        if (call.method === "get_radio_track") {
+          // 平台原序：陌生的在前。
+          return { tracks: [freshSong, familiarSong] };
+        }
+        if (call.method === "GetPlaylistByUin") {
+          return { v_playlist: [{ dirName: "我喜欢", tid: 555 }] };
+        }
+        if (call.method === "CgiGetDiss") {
+          return {
+            dirinfo: { dissid: 555 },
+            songlist: [{ mid: "liked", name: "收藏", singer: [{ mid: "known-artist", name: "熟悉歌手" }] }],
+          };
+        }
+        return new Error("unexpected");
+      });
+
+    stub();
+    const familiar = await fetchRoam(new QQClient("uin=12345"), "radio", 10, "familiar");
+    expect(familiar.map((track) => track.id)).toEqual(["known", "unknown"]);
+
+    stub();
+    const fresh = await fetchRoam(new QQClient("uin=12345"), "radio", 10, "fresh");
+    expect(fresh.map((track) => track.id)).toEqual(["unknown", "known"]);
+  });
+
+  it("均衡口味不额外拉「我喜欢」，保持平台原序", async () => {
+    const calls = stubMusicu(() => ({ tracks: [SONG] }));
+
+    const tracks = await fetchRoam(new QQClient("uin=12345"), "radio", 10, "balanced");
+
+    expect(tracks.map((track) => track.id)).toEqual(["song1"]);
+    expect(calls.some((call) => call.method === "GetPlaylistByUin")).toBe(false);
   });
 });

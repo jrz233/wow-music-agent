@@ -640,7 +640,10 @@ export class QQClient {
   /** 只要换票后的凭据；不要把二维码阶段的 Cookie 一起发给数据接口。 */
   private credentialCookie(): string {
     const jar = parseCookies(this.cookie);
-    return [`uin=${this.uin}`, `qm_keyst=${this.musickey}`]
+    // 网页版 / musicu 的 `uin` 必须带 `o` 前缀（`uin=o123456`）：不带前缀时
+    // 上游不认这个身份，响应里的 `login_uin` 是 0，歌单详情一类需要登录态的
+    // 模块会回 `-100006 get diss info from tmem error`（HTTP 仍是 200）。
+    return [`uin=o${this.uin}`, `qm_keyst=${this.musickey}`]
       .concat([...jar.entries()].filter(([key]) => key.startsWith("qq_")).map(([k, v]) => `${k}=${v}`))
       .join("; ");
   }
@@ -672,7 +675,15 @@ export class QQClient {
       // wow-server 的调试日志），body 与 Cookie 一律不出现。
       throw unavailable(`QQ 音乐接口返回错误 (${method} ${Number(request.code ?? -1)})`);
     }
-    return asRecord(request.data) ?? {};
+    const data = asRecord(request.data) ?? {};
+    // 有些模块（例如 srfDissInfo）即使业务失败也回 `req_0.code = 0`，真正的
+    // 错误码藏在 `data.code`（如 -100006），同时 data 里是空壳。不查这一层的话，
+    // 上层会把「登录态没被识别」当成「这个歌单是空的」。
+    const innerCode = Number(data.code ?? 0);
+    if (Number.isFinite(innerCode) && innerCode !== 0) {
+      throw unavailable(`QQ 音乐接口返回错误 (${method} ${innerCode})`);
+    }
+    return data;
   }
 
   /** 探活：资料接口能读即视为凭据仍有效。 */

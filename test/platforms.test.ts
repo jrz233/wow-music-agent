@@ -65,6 +65,20 @@ describe("cookie handling", () => {
 });
 
 describe("QQ mapping", () => {
+  it("自建歌单用 tid 而不是 dirId 作为详情 id", () => {
+    // 「我喜欢」的 dirId 固定是 201，但 srfDissInfo 只认 tid；用 201 会回
+    // -100006。参考 wow-origin 的 user_playlist_created：id = tid。
+    const playlist = mapQQPlaylist({
+      dirId: 201,
+      dirName: "我喜欢",
+      tid: 5461570933,
+      songNum: 142,
+    });
+    expect(playlist.id).toBe("5461570933");
+    expect(playlist.name).toBe("我喜欢");
+    expect(playlist.trackCount).toBe(142);
+  });
+
   it("maps a list item and a wrapped track_info", () => {
     const playlist = mapQQPlaylist({
       dissid: 123,

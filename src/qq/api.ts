@@ -7,6 +7,7 @@
  */
 
 import type { AgentPlaylist, AgentPlaylistDetail, AgentTrack } from "../shared/types";
+import { unavailable } from "../shared/errors";
 import { QQClient } from "./client";
 
 const DEFAULT_LIMIT = 100;
@@ -39,25 +40,44 @@ export async function fetchPlaylists(client: QQClient, limit = DEFAULT_LIMIT): P
 /**
  * 歌单详情。
  *
- * `music.srfDissInfo.aiDissInfo/uniform_get_Dissinfo` 是当前客户端在用的模块；
- * 旧的 `DissInfo/CgiGetDiss` 仍然可用，但推荐/私人雷达这类系统歌单只在前者里
- * 稳定返回 `songlist`，所以统一走新模块。
+ * 优先 `music.srfDissInfo.DissInfo/CgiGetDiss`：它是当前客户端仍在用的稳定模块，
+ * 对自建歌单与「我喜欢」都可用。`music.srfDissInfo.aiDissInfo/uniform_get_Dissinfo`
+ * 作为兜底——新模块对部分歌单（例如每日推荐）更宽，但对旧客户端身份会回 10006。
+ * 两个响应结构一致（`dirinfo` + `songlist`），映射只写一份。
  */
 export async function fetchPlaylistDetail(
   client: QQClient,
   id: string,
   limit = DEFAULT_LIMIT,
 ): Promise<AgentPlaylistDetail> {
-  const data = await client.call("music.srfDissInfo.aiDissInfo", "uniform_get_Dissinfo", {
-    disstid: id,
-    userinfo: 1,
-    tag: 1,
-    orderlist: 1,
+  const num = clampLimit(limit);
+  const numericID = Number(id);
+  const page = {
     song_begin: 0,
-    song_num: clampLimit(limit),
-    onlysonglist: 0,
-    enc_host_uin: "",
-  });
+    song_num: num,
+  };
+  let data: Record<string, unknown>;
+  try {
+    data = await client.call("music.srfDissInfo.DissInfo", "CgiGetDiss", {
+      disstid: Number.isFinite(numericID) && numericID > 0 ? numericID : id,
+      dirid: 0,
+      tag: 1,
+      userinfo: 1,
+      orderlist: 1,
+      onlysonglist: 0,
+      ...page,
+    });
+  } catch {
+    data = await client.call("music.srfDissInfo.aiDissInfo", "uniform_get_Dissinfo", {
+      disstid: id,
+      userinfo: 1,
+      tag: 1,
+      orderlist: 1,
+      onlysonglist: 0,
+      enc_host_uin: "",
+      ...page,
+    });
+  }
   const info = asRecord(data.dirinfo) ?? asRecord(data.info) ?? data;
   const tracks = firstArray(data, ["songlist", "songs", "list"])
     .map(mapTrack)
@@ -65,7 +85,7 @@ export async function fetchPlaylistDetail(
   return {
     ...mapPlaylist(info),
     id: text(info.dissid) || text(info.id) || text(info.dirId) || id,
-    tracks: tracks.slice(0, clampLimit(limit)),
+    tracks: tracks.slice(0, num),
   };
 }
 
@@ -109,8 +129,59 @@ export async function fetchDaily(client: QQClient, limit = DEFAULT_LIMIT): Promi
   if (!playlistID) {
     return [];
   }
-  const detail = await fetchPlaylistDetail(client, playlistID, clampLimit(limit));
-  return detail.tracks.slice(0, clampLimit(limit));
+  let tracks: AgentTrack[];
+  let playlistError = "";
+  try {
+    tracks = (await fetchPlaylistDetail(client, playlistID, clampLimit(limit))).tracks;
+  } catch (error) {
+    // 「每日30首」卡片给的是**排行榜 id**（通常 ≤1000），不是普通歌单 id：
+    // 拿它去 `uniform_get_Dissinfo` 会回 10006。排行榜走 ToplistInfoServer。
+    playlistError = error instanceof Error ? error.message : String(error);
+    try {
+      tracks = (await fetchToplistDetail(client, playlistID, clampLimit(limit))).tracks;
+    } catch (toplistError) {
+      const toplistMessage = toplistError instanceof Error ? toplistError.message : String(toplistError);
+      throw unavailable(
+        `每日推荐卡片 ${playlistID} 拉取失败（歌单：${playlistError}；排行榜：${toplistMessage}）`,
+      );
+    }
+  }
+  return tracks.slice(0, clampLimit(limit));
+}
+
+/**
+ * 排行榜详情。
+ *
+ * 只用于「每日30首」这类以排行榜 id 下发的推荐歌单；用户自己的歌单
+ * （含「我喜欢」）仍然是普通 disstid，不能按 id 大小猜类型。
+ */
+export async function fetchToplistDetail(
+  client: QQClient,
+  id: string,
+  limit = DEFAULT_LIMIT,
+): Promise<AgentPlaylistDetail> {
+  const data = await client.call("musicToplist.ToplistInfoServer", "GetDetail", {
+    topid: Number(id) || id,
+    offset: 0,
+    num: clampLimit(limit),
+    period: "",
+  });
+  const info = asRecord(data.data) ?? data;
+  const tracks = firstArray(data, ["songInfoList", "songlist", "songs", "list"])
+    .map(mapTrack)
+    .filter((item) => item.id !== "");
+  return {
+    id: text(info.topId) || text(info.id) || id,
+    name: text(info.title) || text(info.name),
+    description: text(info.intro) || text(info.desc),
+    coverUrl: text(info.mbFrontPicUrl) || text(info.headPicUrl) || text(info.picurl) || "",
+    trackCount: integer(info.totalNum) || integer(info.songnum) || tracks.length,
+    playCount: integer(info.listenNum) || integer(info.listen_num) || 0,
+    tags: [],
+    createdAt: null,
+    updatedAt: seconds(info.updateTime) ?? null,
+    tracks: tracks.slice(0, clampLimit(limit)),
+  };
 }
 
 /** 从货架结构里找出「每日30首」卡片的 id（歌单 id）。 */
@@ -137,10 +208,21 @@ export function dailyPlaylistID(feed: Record<string, unknown>): string {
   return "";
 }
 
+/**
+ * 漫游。
+ *
+ * - `radar`：雷达（`GetRadarSong`），是平台按听歌关系推的「雷达歌单」；
+ * - `radio`：刷歌，也就是 QQ 客户端的「猜你喜欢」电台（固定 `id: 99`）。
+ *
+ * `style` 只影响 radio：上游电台本身没有口味参数，这里用「我喜欢」里的歌手集合
+ * 给返回曲目重排——`familiar` 熟悉歌手优先，`fresh` 陌生歌手优先，`balanced`
+ * 保持平台原序。
+ */
 export async function fetchRoam(
   client: QQClient,
   mode: string,
   limit = DEFAULT_LIMIT,
+  style = "balanced",
 ): Promise<AgentTrack[]> {
   const size = clampLimit(limit);
   if (mode === "radar") {
@@ -183,7 +265,50 @@ export async function fetchRoam(
     }
     if (added === 0) break;
   }
-  return result.slice(0, size);
+  return orderByGuessStyle(result, await favoriteArtists(client, style), style).slice(0, size);
+}
+
+/**
+ * 返回「我喜欢」里出现过的歌手 id 集合；取巧失败时返回空集合（保持平台原序）。
+ * 只有 familiar / fresh 才需要，balanced 不额外发请求。
+ */
+async function favoriteArtists(client: QQClient, style: string): Promise<Set<string>> {
+  if (style !== "familiar" && style !== "fresh") {
+    return new Set();
+  }
+  try {
+    const tracks = await fetchFavorites(client, MAX_LIMIT);
+    const artists = new Set<string>();
+    for (const track of tracks) {
+      for (const artist of track.artists) {
+        if (artist.id) artists.add(artist.id);
+      }
+    }
+    return artists;
+  } catch {
+    return new Set();
+  }
+}
+
+/** orderByGuessStyle 按熟悉/陌生重排；同分保持平台原序（Array#sort 在 Node 20+ 稳定）。 */
+function orderByGuessStyle(tracks: AgentTrack[], known: Set<string>, style: string): AgentTrack[] {
+  if (style !== "familiar" && style !== "fresh") {
+    return tracks;
+  }
+  const familiarFirst = style === "familiar";
+  return tracks
+    .map((track, index) => ({
+      track,
+      index,
+      familiar: track.artists.some((artist) => artist.id !== "" && known.has(artist.id)),
+    }))
+    .sort((left, right) => {
+      if (left.familiar !== right.familiar) {
+        return familiarFirst === left.familiar ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .map((item) => item.track);
 }
 
 export function mapPlaylist(raw: unknown): AgentPlaylist {
@@ -195,7 +320,9 @@ export function mapPlaylist(raw: unknown): AgentPlaylist {
     ...stringArray(value.tags),
   ];
   return {
-    id: text(value.dissid) || text(value.dirId) || text(value.tid) || text(value.id),
+    // `tid` 才是歌单详情接口认的 id。`dirId` 是账号内部目录号（「我喜欢」是 201），
+    // 拿它去 srfDissInfo 会回 `-100006 get diss info from tmem error`。
+    id: text(value.dissid) || text(value.tid) || text(value.id) || text(value.dirId),
     name: text(value.diss_name) || text(value.dirName) || text(value.name) || text(value.title),
     description: text(value.diss_desc) || text(value.desc) || text(value.introduction),
     coverUrl:

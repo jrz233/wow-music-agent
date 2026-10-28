@@ -138,9 +138,12 @@ export function createV1App(store: AgentStore, identity: AgentIdentity) {
     const platform = parsePlatform(c);
     const limit = parseLimit(c);
     const mode = c.req.query("mode") === "radar" ? "radar" : "radio";
+    // 口味只对 QQ 的「猜你喜欢」电台有意义；normalize 掉未知值，避免把任意字符串
+    // 当业务参数透传给上游。
+    const style = parseGuessStyle(c);
     const items = await withPlatform(store, platform, (credential) => {
       if (platform === "qq") {
-        return fetchQQRoam(new QQClient(credential), mode, limit);
+        return fetchQQRoam(new QQClient(credential), mode, limit, style);
       }
       return fetchNeteaseRoam(new NeteaseClient(credential), limit);
     });
@@ -301,8 +304,18 @@ function parsePlatform(c: Context): Platform {
   throw badRequest("platform 参数无效");
 }
 
-function parseLimit(c: Context): number {
-  const raw = c.req.query("limit") ?? "";
+function parseGuessStyle(c: Context): string {
+  switch (c.req.query("style")) {
+    case "familiar":
+      return "familiar";
+    case "fresh":
+      return "fresh";
+    default:
+      return "balanced";
+  }
+}
+
+function parseLimit(c: Context): number {  const raw = c.req.query("limit") ?? "";
   const value = Number.parseInt(raw, 10);
   if (!Number.isFinite(value) || value <= 0) {
     return DEFAULT_LIMIT;
