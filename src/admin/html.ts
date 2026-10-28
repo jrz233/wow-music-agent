@@ -75,7 +75,8 @@ export function loginPage(nonce: string, message: string, serverUrl: string): st
  *
  * 不能直接 303 到 wow-server：CSP 的 `form-action 'self'` 会连表单提交后的重定向
  * 一起校验，Chrome 会拦掉跨站跳转。这里返回同源页面，用 meta refresh 离开——它不受
- * `form-action` 约束；`Referrer-Policy: no-referrer` 保证地址里的 state 不外泄。
+ * `form-action` 约束；`Referrer-Policy: same-origin`（见 `routes.ts` 的 `html()`）
+ * 保证跨站跳转不带 `Referer`，地址里的 state 不外泄。
  */
 export function oauthRedirectPage(nonce: string, authorizeUrl: string): string {
   const url = escapeHtml(authorizeUrl);

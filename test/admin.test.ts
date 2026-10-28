@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AgentStore } from "../src/agent/store";
+import type { AgentIdentity } from "../src/agent/oauth";
 import { SESSION_COOKIE } from "../src/env";
+import { createAdminApp } from "../src/admin/routes";
 import {
   currentSession,
   requireAdminWrite,
@@ -128,5 +130,24 @@ describe("origin checks", () => {
     });
     expect(sameOrigin(referer)).toBe(true);
     expect(sameOrigin(new Request("https://agent.example/admin", { method: "POST" }))).toBe(false);
+  });
+
+  /**
+   * `no-referrer` 会让浏览器把**同源**表单 POST 的 `Origin` 也降成 `null`，
+   * 于是登录页的「登录」按钮在真实浏览器里必然 403（curl 手打 Origin 看不出来）。
+   * 这条用例把「管理页必须是 `same-origin`」钉在响应头上。
+   */
+  it("serves the login page with a referrer policy that keeps same-origin POSTs checkable", async () => {
+    const app = createAdminApp(
+      {
+        session: () => null,
+        agent: () => null,
+      } as unknown as AgentStore,
+      {} as AgentIdentity,
+      async () => {},
+    );
+    const response = await app.request("https://agent.example/admin/login");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Referrer-Policy")).toBe("same-origin");
   });
 });

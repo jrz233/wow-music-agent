@@ -72,7 +72,8 @@ wow-server 只能读取白名单内的歌单、收藏、每日推荐与漫游数
   授权码带到第三方 origin，超时 15 秒，响应体上限 64 KiB。
 - 授权成功后用同源中转页（`meta refresh`）跳去 wow-server：CSP 的 `form-action 'self'`
   会拦截表单提交后的跨站 303，中转页不受该指令约束，同时保持 `Referrer-Policy:
-  no-referrer`。
+  same-origin`。（不能写 `no-referrer`：那种策略下浏览器会把同源表单 POST 的
+  `Origin` 也降成 `null`，同源校验就永远拿不到可信来源。）
 
 ### 3. Agent 接口（wow-server → Agent）
 

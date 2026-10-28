@@ -363,7 +363,12 @@ function html(body: string, nonce: string, status = 200): Response {
         "base-uri 'none'",
         "frame-ancestors 'none'",
       ].join("; "),
-      "Referrer-Policy": "no-referrer",
+      // 必须是 `same-origin`，不能是 `no-referrer`：按 Fetch 规范，referrer policy 为
+      // `no-referrer` 时浏览器会把**同源**表单 POST 的 `Origin` 也写成 `null`，
+      // 同源校验就再也拿不到可信来源（实测无头 Chromium：`Origin: null` + 无
+      // `Referer` → 403）。`same-origin` 仍然不给**跨站**请求带 `Referer`，
+      // 中转页跳去 wow-server 时地址里的 `state` 照样不外泄。
+      "Referrer-Policy": "same-origin",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
     },
