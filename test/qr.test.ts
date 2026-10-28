@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDecipheriv } from "node:crypto";
 import { QQClient } from "../src/qq/client";
 import { NeteaseClient } from "../src/netease/client";
+import { aes128EcbEncrypt } from "../src/netease/aes";
 import { sniffImageMime } from "../src/shared/image";
 
 /** 8 字节 PNG 魔数 + 一点填充，够用来做类型判断。 */
@@ -118,35 +120,50 @@ describe("QQ QR", () => {
   });
 });
 
+/** 把 eapi 响应体按协议加密：登录链路读的是密文，不是明文 JSON。 */
+function eapiResponse(payload: unknown): Response {
+  const bytes = aes128EcbEncrypt(
+    new TextEncoder().encode(EAPI_KEY),
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  return new Response(bytes, { status: 200, headers: { "Content-Type": "application/octet-stream" } });
+}
+
+const EAPI_KEY = "e82ckenh8dichen8";
+
+/** 解开 eapi 请求体，好断言「带没带 e_r / header」。 */
+function decodeEapiParams(body: string): Record<string, unknown> {
+  const params = new URLSearchParams(body).get("params") ?? "";
+  const decipher = createDecipheriv("aes-128-ecb", Buffer.from(EAPI_KEY), Buffer.alloc(0));
+  const plain = Buffer.concat([
+    decipher.update(Buffer.from(params, "hex")),
+    decipher.final(),
+  ]).toString("utf8");
+  const match = /^(.*?)-36cd479b6b5-(.*?)-36cd479b6b5-[0-9a-f]{32}$/u.exec(plain);
+  if (!match) {
+    throw new Error("eapi 请求体格式不对");
+  }
+  return JSON.parse(match[2] as string) as Record<string, unknown>;
+}
+
 describe("NetEase QR", () => {
-  it("asks the web player for the QR image and inlines it", async () => {
-    const calls: { url: string; body: string }[] = [];
+  it("renders the QR locally and asks the interface host for the key", async () => {
+    const calls: { url: string; body: string; headers: Record<string, string> }[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
-        calls.push({ url, body: String(init?.body ?? "") });
-        if (url.includes("/weapi/login/qrcode/unikey")) {
-          return new Response(JSON.stringify({ unikey: "KEY-123" }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
+        calls.push({
+          url,
+          body: String(init?.body ?? ""),
+          headers: (init?.headers ?? {}) as Record<string, string>,
+        });
+        if (url.includes("/eapi/login/qrcode/unikey")) {
+          return eapiResponse({ code: 200, unikey: "KEY-123" });
         }
-        if (url.includes("/api/web/qrcode/get")) {
-          return new Response(
-            JSON.stringify({
-              qrcodeImageUrl: "https://p6.music.126.net/obj/x/MUSICabc.jpg",
-              code: 200,
-            }),
-            { status: 200, headers: { "Content-Type": "application/json" } },
-          );
+        if (url.includes("/eapi/login/qrcode/client/login")) {
+          return eapiResponse({ code: 801 });
         }
-        if (url.includes("/weapi/login/qrcode/client/login")) {
-          return new Response(JSON.stringify({ code: 801 }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        return new Response(JPEG_BYTES, { status: 200 });
+        throw new Error(`不该请求 ${url}`);
       }),
     );
 
@@ -154,34 +171,94 @@ describe("NetEase QR", () => {
     const qr = await client.createQR();
 
     expect(qr.key).toBe("KEY-123");
-    expect(qr.imageDataUrl.startsWith("data:image/jpeg;base64,")).toBe(true);
+    // 二维码本地渲染成 SVG，不再去网易云取图。
+    expect(qr.imageDataUrl.startsWith("data:image/svg+xml;base64,")).toBe(true);
 
-    // 二维码内容仍然是 codekey 登录页，不能换成别的地址。
-    const request = calls.find((call) => call.url.includes("/api/web/qrcode/get"));
-    expect(request?.body).toContain("url=https%3A%2F%2Fmusic.163.com%2Flogin%3Fcodekey%3DKEY-123");
+    // 登录必须走 eapi（interface 域名 + /eapi/ 前缀），不能退回 weapi：
+    // weapi 的 key 在手机客户端侧没有记录，扫码结果无处可写。
+    const unikey = calls.find((call) => call.url.includes("/eapi/login/qrcode/unikey"));
+    expect(unikey).toBeTruthy();
+    expect(calls.some((call) => call.url.includes("/weapi/"))).toBe(false);
+    // 也不该再去抓图片 CDN。
+    expect(calls).toHaveLength(1);
+
+    // 请求体必须带 e_r 与设备 header：缺 e_r 上游会回明文，登录就废了。
+    const payload = decodeEapiParams(unikey?.body ?? "");
+    expect(payload.e_r).toBe(true);
+    expect(payload.type).toBe(3);
+    const header = payload.header as Record<string, unknown>;
+    expect(header.os).toBe("pc");
+    expect(header.appver).toBe("3.1.19.204510");
+    expect(header.osver).toContain("Windows");
+
+    // 要装成网易云桌面客户端，并带上设备四件套。
+    expect(unikey?.headers["User-Agent"]).toContain("NeteaseMusicDesktop");
+    expect(unikey?.headers.Cookie).toContain("appver=3.1.19.204510");
 
     const state = await client.checkQR(qr.key);
     expect(state.state).toBe("waiting");
   });
 
-  it("refuses a QR image hosted outside NetEase", async () => {
+  it("also accepts a plaintext eapi response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ code: 200, unikey: "KEY-PLAIN" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new NeteaseClient();
+    const qr = await client.createQR();
+    expect(qr.key).toBe("KEY-PLAIN");
+  });
+
+  it("reports a response that is neither cipher nor JSON", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not json at all", { status: 200 })),
+    );
+
+    const client = new NeteaseClient();
+    await expect(client.createQR()).rejects.toThrow(/密文/u);
+  });
+
+  it("maps the login status codes and keeps MUSIC_U", async () => {
+    let loginCode = 801;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) => {
-        if (url.includes("/weapi/login/qrcode/unikey")) {
-          return new Response(JSON.stringify({ unikey: "KEY-123" }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
+        if (url.includes("/eapi/login/qrcode/unikey")) {
+          return eapiResponse({ code: 200, unikey: "KEY-123" });
         }
         return new Response(
-          JSON.stringify({ qrcodeImageUrl: "https://evil.example.com/qr.jpg", code: 200 }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
+          aes128EcbEncrypt(
+            new TextEncoder().encode(EAPI_KEY),
+            new TextEncoder().encode(JSON.stringify({ code: loginCode })),
+          ),
+          {
+            status: 200,
+            headers:
+              loginCode === 803 ? { "set-cookie": "MUSIC_U=abc%2Cdef%3D; Path=/" } : {},
+          },
         );
       }),
     );
 
     const client = new NeteaseClient();
-    await expect(client.createQR()).rejects.toThrow(/二维码/u);
+    await client.createQR();
+
+    loginCode = 802;
+    expect((await client.checkQR("KEY-123")).state).toBe("scanned");
+
+    loginCode = 800;
+    expect((await client.checkQR("KEY-123")).state).toBe("expired");
+
+    loginCode = 803;
+    const success = await client.checkQR("KEY-123");
+    expect(success.state).toBe("success");
+    expect(success.state === "success" && success.cookies).toContain("MUSIC_U=abc%2Cdef%3D");
   });
 });

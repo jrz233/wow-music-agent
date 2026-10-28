@@ -1,8 +1,11 @@
 /**
- * 网易云数据面：把 weapi 的响应映射成 Agent 的**语义化**形状。
+ * 网易云数据面：把上游响应映射成 Agent 的**语义化**形状。
  *
  * 平台字段改名时就只改这一层；上层（`agent/v1.ts`）与 wow-server 都不认识
  * `ar/al/dt` 这类缩写。所有输出都会经过 `limit` 截断，绝不把整份歌单原样透传。
+ *
+ * 接口与加密方式对齐 wow-origin（`platforms/netease/module/*.js`）：
+ * 歌单、详情、每日推荐走 eapi；Personal FM 走 weapi 并带上风控令牌。
  */
 
 import type { AgentPlaylist, AgentPlaylistDetail, AgentTrack } from "../shared/types";
@@ -57,13 +60,15 @@ export async function fetchFavorites(client: NeteaseClient, limit = DEFAULT_LIMI
 }
 
 export async function fetchDaily(client: NeteaseClient, limit = DEFAULT_LIMIT): Promise<AgentTrack[]> {
-  const data = await client.call("v2/discovery/recommend/songs", {});
+  // 参考实现用的是 `/v1/discovery/recommend/songs`（不是 v2）。
+  const data = await client.call("v1/discovery/recommend/songs", { limit: 100 });
   const inner = record(data.data) ?? data;
   return array(inner.dailySongs).map(mapTrack).slice(0, clampLimit(limit));
 }
 
 export async function fetchRoam(client: NeteaseClient, limit = DEFAULT_LIMIT): Promise<AgentTrack[]> {
-  const data = await client.call("v1/radio/get", {});
+  // Personal FM 走 weapi，并带风控令牌——少了会被判成爬虫。
+  const data = await client.callWeb("v1/radio/get", {}, { antiCheat: true });
   return array(data.data).map(mapTrack).slice(0, clampLimit(limit));
 }
 

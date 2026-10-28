@@ -1,22 +1,49 @@
 /**
- * 网易云 weapi 传输层。
+ * 网易云传输层：eapi（客户端接口）与 weapi（网页版接口）。
  *
  * 只负责：带 Cookie 的 POST、响应解包、Set-Cookie 合并、二维码登录三步。
  * 业务字段映射在 `api.ts`，不要在传输层做形状转换。
+ *
+ * 协议细节与 wow-origin（`platforms/netease/util/request.js`）保持一致：
+ *
+ *  - **eapi**：请求体里必须带 `header`（设备信息）与 `e_r: true`；**不带 `e_r` 时上游
+ *    回的是明文 JSON**，按密文解就会报「密文无法解密」。带了 `e_r` 之后响应体是同一
+ *    固定密钥的 ECB 密文，解密才是 JSON。
+ *  - **weapi**：网页版接口，双层 AES-CBC + RSA，Cookie 里带 `MUSIC_U`。
+ *  - 两种接口都要装成「客户端 / 浏览器」，否则风控会挡。
  */
 
 import { mergeCookies, parseCookies, platformFetch } from "../shared/http";
 import { unavailable } from "../shared/errors";
-import { imageDataUrl, sniffImageMime } from "../shared/image";
-import { weapi } from "./crypto";
+import { checkToken } from "./checktoken";
+import { eapiDecrypt, eapiParams, eapiPath, weapi } from "./crypto";
+import { neteaseLoginURL, qrCodeDataUrl } from "./qr";
 
 const MUSIC_BASE = "https://music.163.com";
 const REFERER = "https://music.163.com/";
-const API_HEADERS = {
-  "Content-Type": "application/x-www-form-urlencoded",
-  Referer: REFERER,
-  Origin: MUSIC_BASE,
-};
+
+/** eapi 要装成网易云桌面客户端。 */
+const DESKTOP_UA =
+  "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/3.1.19.204510";
+
+/** weapi 走网页版接口，用浏览器 UA。 */
+const WEB_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
+
+/**
+ * eapi 请求头里的设备信息。
+ *
+ * 这四件套是网易云客户端的固定指纹，缺一项上游会当成异常流量拒掉；值与
+ * wow-origin 的 `DEFAULT_HEADER` 保持一致。
+ */
+const DEVICE_HEADER = {
+  os: "pc",
+  appver: "3.1.19.204510",
+  requestId: 0,
+  osver: "Microsoft-Windows-11-Home-China-build-22631-64bit",
+} as const;
 
 export interface NeteaseAccount {
   userId: string;
@@ -35,6 +62,11 @@ export type QRState =
   | { state: "expired" }
   | { state: "success"; cookies: string };
 
+export interface RequestOptions {
+  /** 带上 `x-anticheattoken`；只有少数接口（Personal FM）需要。 */
+  antiCheat?: boolean;
+}
+
 export class NeteaseClient {
   cookie: string;
   private csrf: string;
@@ -44,19 +76,84 @@ export class NeteaseClient {
     this.csrf = parseCookies(cookie).get("__csrf") ?? "";
   }
 
-  private async request(path: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  /**
+   * eapi 请求：网易云的「客户端接口」。
+   *
+   * 登录链路必须走它——手机端把扫码结果写进 **eapi 会话**，weapi 的 key 在客户端侧
+   * 没有对应记录，于是 `client/login` 永远停在 801。见 `crypto.ts` 的说明。
+   *
+   * 响应体是同一固定密钥的 ECB 密文；先解密再当 JSON 读。Cookie 一律回写：登录阶段
+   * `Set-Cookie` 里的 `MUSIC_U` 就是扫码成功的凭证。
+   */
+  private async eapiRequest(
+    path: string,
+    payload: Record<string, unknown>,
+    options: RequestOptions = {},
+  ): Promise<Record<string, unknown>> {
+    const apiPath = path.startsWith("/api/") ? path : `/api/${path}`;
+    const deviceHeader: Record<string, unknown> = { ...DEVICE_HEADER };
+    const musicU = parseCookies(this.cookie).get("MUSIC_U");
+    if (musicU) {
+      // 请求头里的 MUSIC_U 用解码后的形式，Cookie 头里用原始形式——和上游一致。
+      deviceHeader.MUSIC_U = decodeCookieValue(musicU);
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Referer: REFERER,
+      Origin: MUSIC_BASE,
+      "User-Agent": DESKTOP_UA,
+      Cookie: this.eapiCookie(),
+    };
+    if (options.antiCheat) {
+      const token = checkToken("eapi");
+      headers["x-anticheattoken"] = token;
+      deviceHeader["X-anticheattoken"] = token;
+    }
+
+    // `e_r: true` 是关键：它告诉上游「按密文回」，同时也带上设备指纹。
+    const requestPayload: Record<string, unknown> = {
+      ...payload,
+      header: deviceHeader,
+      e_r: true,
+    };
+    const body = new URLSearchParams({ params: eapiParams(apiPath, requestPayload) }).toString();
+    const response = await platformFetch(eapiPath(apiPath), {
+      method: "POST",
+      headers,
+      body,
+    });
+    this.cookie = mergeCookies(this.cookie, response);
+    if (!response.ok) {
+      throw unavailable(`网易云返回 HTTP ${response.status}`);
+    }
+    return parseEapiBody(new Uint8Array(await response.arrayBuffer()));
+  }
+
+  /** weapi 请求：网页版接口（账号信息、Personal FM）。 */
+  private async weapiRequest(
+    path: string,
+    payload: Record<string, unknown>,
+    options: RequestOptions = {},
+  ): Promise<Record<string, unknown>> {
     const encrypted = await weapi(payload);
     const body = new URLSearchParams({
       params: encrypted.params,
       encSecKey: encrypted.encSecKey,
     }).toString();
     const query = this.csrf ? `?csrf_token=${encodeURIComponent(this.csrf)}` : "";
+    const headers: Record<string, string> = {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Referer: REFERER,
+      Origin: MUSIC_BASE,
+      "User-Agent": WEB_UA,
+      Cookie: this.cookie,
+    };
+    if (options.antiCheat) {
+      headers["x-anticheattoken"] = checkToken("weapi");
+    }
     const response = await platformFetch(`${MUSIC_BASE}/weapi/${path}${query}`, {
       method: "POST",
-      headers: {
-        ...API_HEADERS,
-        Cookie: this.cookie,
-      },
+      headers,
       body,
     });
     this.cookie = mergeCookies(this.cookie, response);
@@ -72,61 +169,36 @@ export class NeteaseClient {
     }
   }
 
+  /** eapi 调用：绝大多数网易云模块都走它。 */
+  async call(
+    path: string,
+    payload: Record<string, unknown> = {},
+    options: RequestOptions = {},
+  ): Promise<Record<string, unknown>> {
+    return this.eapiRequest(path, payload, options);
+  }
+
+  /** weapi 调用：网页版接口。 */
+  async callWeb(
+    path: string,
+    payload: Record<string, unknown> = {},
+    options: RequestOptions = {},
+  ): Promise<Record<string, unknown>> {
+    return this.weapiRequest(path, payload, options);
+  }
+
   async createQR(): Promise<QRCode> {
-    const data = await this.request("login/qrcode/unikey", { type: 1 });
+    const data = await this.eapiRequest("login/qrcode/unikey", { type: 3 });
     const key = String(data.unikey ?? "");
     if (!key) {
       throw unavailable("网易云没有返回二维码 key");
     }
-    return { key, imageDataUrl: await this.fetchQRImage(key) };
-  }
-
-  /**
-   * 取二维码图片。
-   *
-   * 旧做法是直接 GET `login?codekey=…` 指望它回一张 PNG——现在那个地址回的是
-   * 网页版登录页的 HTML，二维码自然永远显示不出来。网页版自己也是先向
-   * `/api/web/qrcode/get` 要一张渲染好的图，再去 CDN 取。
-   *
-   * 这里由 Worker 代取并内联成 data URL：既不把用户 IP 暴露给图片 CDN，
-   * 管理页的 CSP 也不用为 `music.163.com` 开口子。
-   */
-  private async fetchQRImage(key: string): Promise<string> {
-    const pageURL = `${MUSIC_BASE}/login?codekey=${encodeURIComponent(key)}`;
-    const response = await platformFetch(`${MUSIC_BASE}/api/web/qrcode/get`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Referer: REFERER,
-      },
-      body: new URLSearchParams({ url: pageURL, size: "180" }).toString(),
-    });
-    if (!response.ok) {
-      throw unavailable("网易云二维码获取失败");
-    }
-    let payload: Record<string, unknown>;
-    try {
-      payload = (await response.json()) as Record<string, unknown>;
-    } catch {
-      throw unavailable("网易云二维码获取失败");
-    }
-    const imageURL = String(payload.qrcodeImageUrl ?? "");
-    if (!isNeteaseImageURL(imageURL)) {
-      throw unavailable("网易云二维码获取失败");
-    }
-    const image = await platformFetch(imageURL, {
-      headers: { Referer: REFERER, Accept: "image/*" },
-    });
-    const bytes = new Uint8Array(await image.arrayBuffer());
-    const mime = sniffImageMime(bytes);
-    if (!image.ok || !mime) {
-      throw unavailable("网易云二维码获取失败");
-    }
-    return imageDataUrl(bytes, mime);
+    // 二维码本地渲染：内容与网易云网页版一致，手机扫到的行为也一样。
+    return { key, imageDataUrl: qrCodeDataUrl(neteaseLoginURL(key)) };
   }
 
   async checkQR(key: string): Promise<QRState> {
-    const data = await this.request("login/qrcode/client/login", { key, type: 1 });
+    const data = await this.eapiRequest("login/qrcode/client/login", { key, type: 3 });
     const code = Number(data.code ?? 0);
     if (code === 803) {
       return { state: "success", cookies: this.cookie };
@@ -142,7 +214,7 @@ export class NeteaseClient {
 
   /** 读取当前登录账号；失败抛错（Cookie 失效会返回 code 301）。 */
   async account(): Promise<NeteaseAccount> {
-    const data = await this.request("w/nuser/account/get", {});
+    const data = await this.weapiRequest("nuser/account/get", {});
     const profile = data.profile as Record<string, unknown> | undefined;
     if (!profile) {
       throw unavailable("网易云登录状态无效");
@@ -159,35 +231,58 @@ export class NeteaseClient {
    * 失败就由上层标记 degraded/logged_out，用户重新扫码即可。
    */
   async refresh(): Promise<boolean> {
-    const data = await this.request("login/token/refresh", {});
+    const data = await this.eapiRequest("login/token/refresh", {});
     return Number(data.code ?? 0) === 200;
   }
 
-  /** 内部读取接口；返回原始 `data` 字段或整个响应。 */
-  async call(path: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    return this.request(path, payload);
+  /**
+   * eapi 请求带出去的 Cookie。
+   *
+   * 设备四件套是网易云客户端的固定指纹；`MUSIC_U` 用**原始**值（Cookie 头里必须是
+   * 编码后的形式），其余自己攒的 Cookie（NMTID / __csrf）一起带上。
+   */
+  private eapiCookie(): string {
+    const jar = parseCookies(this.cookie);
+    const parts = [
+      `os=${DEVICE_HEADER.os}`,
+      `appver=${DEVICE_HEADER.appver}`,
+      `requestId=${DEVICE_HEADER.requestId}`,
+      `osver=${encodeURIComponent(DEVICE_HEADER.osver)}`,
+    ];
+    for (const [key, value] of jar.entries()) {
+      if (key === "os" || key === "appver" || key === "requestId" || key === "osver") {
+        continue;
+      }
+      parts.push(`${key}=${value}`);
+    }
+    return parts.join("; ");
   }
 }
 
 /**
- * 只允许取网易云自家域名下的图片。
+ * 解析 eapi 响应体。
  *
- * URL 由网易云返回、不是用户给的，风险本来就低；但 Worker 会真的去请求它，
- * 顺手把范围收窄到网易云的域名，免得哪天上游回了个内网地址就被我们照着打。
+ * 带 `e_r` 的请求回的是 ECB 密文；万一是明文 JSON（老客户端路径）也要认，
+ * 否则用户只会看到一句没头没尾的「密文无法解密」。
  */
-function isNeteaseImageURL(raw: string): boolean {
-  if (!raw.startsWith("https://")) {
-    return false;
-  }
-  let host: string;
+function parseEapiBody(bytes: Uint8Array): Record<string, unknown> {
   try {
-    host = new URL(raw).hostname.toLowerCase();
+    return JSON.parse(eapiDecrypt(bytes)) as Record<string, unknown>;
   } catch {
-    return false;
+    // 落到明文分支。
   }
-  return (
-    host === "music.163.com" ||
-    host.endsWith(".music.163.com") ||
-    host.endsWith(".126.net")
-  );
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+  } catch {
+    throw unavailable("网易云返回的密文无法解密");
+  }
+}
+
+/** Cookie 值是 URL 编码的；解不开就原样用。 */
+function decodeCookieValue(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }

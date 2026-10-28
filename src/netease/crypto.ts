@@ -6,6 +6,9 @@
  * 不需要私钥，因此不必引入 crypto.subtle 的 RSA importKey/DER 处理）。
  */
 
+import { aes128EcbDecrypt, aes128EcbEncrypt } from "./aes";
+import { md5 } from "./md5";
+
 const PRESET_KEY = "0CoJUm6Qyw8W8jud";
 const IV = "0102030405060708";
 const BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -112,4 +115,59 @@ function fromBase64(value: string): Uint8Array {
     result[index] = binary.charCodeAt(index);
   }
   return result;
+}
+
+/* ══════════════════════════════ eapi ══════════════════════════════
+ *
+ * 登录链路必须用 eapi，不能用 weapi。
+ *
+ * 实测：`POST /weapi/login/qrcode/unikey` 能出一个 key，也能出二维码图，手机扫完
+ * 也提示成功，但 `login/qrcode/client/login` 永远停在 801（等待扫码）——手机端
+ * 认的是 **eapi** 的会话，weapi 那一路的 key 在客户端侧没有对应记录，于是扫码
+ * 结果无处可写。参考实现（wow-origin `platforms/netease/module/login_qr_*.js`）
+ * 用的正是 eapi + `type: 3`。
+ *
+ * eapi 与 weapi 的差别：
+ *   - 固定密钥 AES-128-**ECB**（无 IV），输出 **大写 HEX**；
+ *   - 明文是 `<url>-36cd479b6b5-<json>-36cd479b6b5-<md5("nobody"+url+"use"+json+"md5forencrypt")>`；
+ *   - 打到 `https://interface.music.163.com/eapi/<去掉 /api 前缀的路径>`；
+ *   - 响应体也是同一密钥的 ECB 密文，要解密后才能当 JSON 读。
+ */
+
+const EAPI_KEY = "e82ckenh8dichen8";
+const EAPI_PAD = "-36cd479b6b5-";
+const EAPI_HOST = "https://interface.music.163.com";
+
+/** eapi 请求体：`params=<大写 HEX>`。 */
+export function eapiParams(path: string, payload: Record<string, unknown>): string {
+  const text = JSON.stringify(payload);
+  const digest = md5Hex(`nobody${path}use${text}md5forencrypt`);
+  return aesEcbHex(`${path}${EAPI_PAD}${text}${EAPI_PAD}${digest}`);
+}
+
+/** 解 eapi 响应体（密文是原始字节，不是 HEX 文本）。 */
+export function eapiDecrypt(bytes: Uint8Array): string {
+  return new TextDecoder().decode(aes128EcbDecrypt(encoder.encode(EAPI_KEY), bytes));
+}
+
+/** eapi 路径：`/api/xxx` → `/eapi/xxx`。 */
+export function eapiPath(path: string): string {
+  const trimmed = path.startsWith("/api/") ? path.slice(4) : path.startsWith("/") ? path : `/${path}`;
+  return `${EAPI_HOST}/eapi${trimmed.startsWith("/") ? trimmed : `/${trimmed}`}`;
+}
+
+function aesEcbHex(text: string): string {
+  return hexUpper(aes128EcbEncrypt(encoder.encode(EAPI_KEY), encoder.encode(text)));
+}
+
+function md5Hex(text: string): string {
+  return md5(encoder.encode(text));
+}
+
+function hexUpper(bytes: Uint8Array): string {
+  let result = "";
+  for (const byte of bytes) {
+    result += byte.toString(16).padStart(2, "0");
+  }
+  return result.toUpperCase();
 }
