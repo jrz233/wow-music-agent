@@ -194,6 +194,63 @@ describe("QQ QR login", () => {
     expect(seen.some((item) => item.body.includes("QQConnectLogin.LoginServer"))).toBe(false);
   });
 
+  it("check_sig 要跟着跳转走，p_skey 在最后一跳才下发", async () => {
+    const seen = stubFetch([
+      { match: "ptqrshow", reply: { body: PNG_BYTES, headers: { "set-cookie": "qrsig=xyz; Path=/" } } },
+      {
+        match: "ptqrlogin",
+        reply: { body: `ptuiCB('0','0','${JUMP}','0','登录成功','X')` },
+      },
+      {
+        match: "check_sig",
+        reply: ((request: Seen): Reply =>
+          request.url.includes("hop=2")
+            ? { headers: { "set-cookie": "p_skey=P_SKEY_VALUE; Domain=qq.com; Path=/" } }
+            : {
+                status: 302,
+                headers: { location: JUMP.replace("check_sig?", "check_sig?hop=2&") },
+              }),
+      },
+      {
+        match: "graph.qq.com/oauth2.0/authorize",
+        reply: {
+          status: 302,
+          headers: {
+            location: "https://y.qq.com/portal/wx_redirect.html?code=ONE_TIME_CODE&state=x",
+          },
+        },
+      },
+      {
+        match: "QQConnectLogin.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: {
+              code: 0,
+              data: { str_musicid: "123456789", musickey: "MUSIC_KEY_VALUE", nick: "小明" },
+            },
+          }),
+        },
+      },
+      {
+        match: "music.getSession.session",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: { code: 0, data: { session: { uid: "6822168287", sid: "20261028163110" } } },
+          }),
+        },
+      },
+    ]);
+
+    const client = new QQClient();
+    await client.createQR();
+    const state = await client.checkQR();
+
+    expect(state.state).toBe("success");
+    expect(seen.some((item) => item.url.includes("hop=2"))).toBe(true);
+  });
+
   it("轮询回到吐出二维码的那台机器", async () => {
     const seen = stubFetch([
       // xui 这一路拿不到图，落到 ssl 那一路。

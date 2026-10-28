@@ -321,30 +321,8 @@ export class QQClient {
     if (!jump.searchParams.get("uin") || !jump.searchParams.get("ptsigx")) {
       throw unavailable("QQ 登录跳转缺少 uin 或 ptsigx");
     }
-    const check = await platformFetch(jump.toString(), {
-      headers: {
-        Referer: this.endpoint.referer,
-        Cookie: this.cookie,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "User-Agent": LOGIN_UA,
-        "Accept-Language": LOGIN_LANGUAGE,
-        "Upgrade-Insecure-Requests": "1",
-      },
-      redirect: "manual",
-    });
-    this.cookie = mergeCookies(this.cookie, check);
-    await check.arrayBuffer().catch(() => undefined);
 
-    const pSkey = ["p_skey", "p_sKey", "skey", "pskey"]
-      .map((key) => cookieValue(this.cookie, key))
-      .find((value) => value !== "");
-    if (!pSkey) {
-      // 带上 HTTP 状态与是否发生跳转：少了 p_skey 的原因就在这两者里。
-      const location = check.headers.get("location");
-      throw unavailable(
-        `QQ 会话校验未返回 p_skey (HTTP ${check.status}${location ? ", 有跳转" : ""})`,
-      );
-    }
+    const pSkey = await this.checkSig(jump);
 
     const ui = crypto.randomUUID().replace(/-/gu, "").toUpperCase();
     const body = new URLSearchParams({
@@ -385,6 +363,59 @@ export class QQClient {
       throw unavailable("QQ 授权未返回 code");
     }
     return code;
+  }
+
+  /**
+   * 走 `check_sig` 校验链，取回 `p_skey`。
+   *
+   * 这一步**不是一次请求**：QQ 的校验链每跳一次换一次 `ptsig`，`p_skey` 要到最后
+   * 跳才下发。第一跳只回 302（Location 指向下一跳），不跟就永远拿不到 `p_skey`
+   * ——表现出来就是「扫码成功了却登录失败」。
+   *
+   * 边界：只跟 `ptlogin2.graph.qq.com` 这一台的跳转。跳出这一台的下一跳就是
+   * 授权回跳（地址里带一次性 code），不能去打开，否则 code 会进日志。
+   */
+  private async checkSig(jump: URL): Promise<string> {
+    const trace: string[] = [];
+    let current = jump;
+    for (let hop = 0; hop < 4; hop += 1) {
+      const response = await platformFetch(current.toString(), {
+        headers: {
+          Referer: this.endpoint.referer,
+          Cookie: this.cookie,
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "User-Agent": LOGIN_UA,
+          "Accept-Language": LOGIN_LANGUAGE,
+          "Upgrade-Insecure-Requests": "1",
+        },
+        redirect: "manual",
+      });
+      this.cookie = mergeCookies(this.cookie, response);
+      await response.arrayBuffer().catch(() => undefined);
+
+      const location = response.headers.get("location");
+      trace.push(
+        `${current.host}${current.pathname}[${[...current.searchParams.keys()].join(",")}] → ${response.status}${location ? " 跳转" : ""}`,
+      );
+
+      const pSkey = ["p_skey", "p_sKey", "skey", "pskey"]
+        .map((key) => cookieValue(this.cookie, key))
+        .find((value) => value !== "");
+      if (pSkey) {
+        return pSkey;
+      }
+      if (!location) {
+        break;
+      }
+      const next = new URL(location, current);
+      // 只在 check_sig 这一台的两种写法之间跳（ssl.ptlogin2.graph.qq.com 与
+      // ptlogin2.graph.qq.com 会互跳）；跳出这一台就是授权回跳，不能去打开。
+      if (next.protocol !== "https:" || !isCheckSigHost(next.hostname)) {
+        break;
+      }
+      current = next;
+    }
+    throw unavailable(`QQ 会话校验未返回 p_skey（${trace.join(" / ")}）`);
   }
 
   /** `QQConnectLogin.LoginServer/QQLogin`：用一次性 code 换 musickey。 */
@@ -651,6 +682,12 @@ function codeFrom(location: string): string {
 function isQQHost(hostname: string): boolean {
   const host = hostname.toLowerCase();
   return host === "qq.com" || host.endsWith(".qq.com");
+}
+
+/** check_sig 校验链所在的主机（`ssl.` 前缀会被 QQ 换掉）。 */
+function isCheckSigHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "ptlogin2.graph.qq.com" || host.endsWith(".ptlogin2.graph.qq.com");
 }
 
 /**
