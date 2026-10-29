@@ -123,14 +123,17 @@ npx wrangler deploy --dry-run --outdir dist
 
 | 路径 | 说明 |
 | --- | --- |
-| `/v1/status` | Agent 版本与两个平台的登录状态 |
+| `/v1/status` | Agent 版本、能力列表与两个平台的登录状态 |
 | `/v1/library/playlists?platform=qq\|netease&limit=` | 用户歌单 |
 | `/v1/library/playlists/:id/tracks?platform=&limit=` | 歌单曲目 |
 | `/v1/library/favorites/tracks?platform=&limit=` | 收藏（「我喜欢的音乐」） |
+| `/v1/library/snapshot?platform=all\|qq\|netease&limit=&trackLimit=&ids=` | 歌单批量快照（列表 + 收藏 + 详情） |
 | `/v1/recommend/daily?platform=&limit=` | 每日推荐 |
 | `/v1/recommend/roam?platform=&mode=radar\|radio&limit=` | 漫游；`mode` 仅 QQ 有效 |
 
 统一响应 `{items, hasMore, nextOffset}`，歌单详情为 `{playlist}`。`limit` 上限 200。
+快照接口返回 `{platforms:{qq:{playlists,favorites,details,error}, netease:{...}}}`，
+`ids` 最多 20 个，用于只补齐指定歌单的详情。
 **不会返回**：平台 Cookie / token、播放地址、歌词、平台隐私字段或任意 URL。
 
 ---

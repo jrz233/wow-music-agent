@@ -158,4 +158,45 @@ describe("v1 signed requests", () => {
     expect(response.status).toBe(401);
     expect(response.headers.get(HEADER_RESPONSE_SIGNATURE)).toBeNull();
   });
+
+  it("advertises the library snapshot capability in status", async () => {
+    const { server, app } = await fixtures();
+    const request = await signedRequest(await importPrivateKey(server.privateKeyPkcs8));
+    const response = await app.fetch(request);
+    const payload = JSON.parse(new TextDecoder().decode(new Uint8Array(await response.arrayBuffer()))) as {
+      capabilities: string[];
+    };
+    expect(payload.capabilities).toContain("library.snapshot");
+  });
+
+  it("returns a signed snapshot with per-platform errors when logged out", async () => {
+    const { server, agentIdentity, app } = await fixtures();
+    const signer = await importPrivateKey(server.privateKeyPkcs8);
+    const nonce = newNonce();
+    const query = "ids=abc%2Cdef&limit=50&platform=all&trackLimit=200";
+    const request = await signedRequest(signer, {
+      path: "/v1/library/snapshot",
+      query,
+      nonce,
+    });
+    const response = await app.fetch(request);
+    expect(response.status).toBe(200);
+
+    const body = new Uint8Array(await response.arrayBuffer());
+    const signature = response.headers.get(HEADER_RESPONSE_SIGNATURE) ?? "";
+    const publicKey = await importPublicKey(base64UrlDecode(agentIdentity.publicKey));
+    expect(
+      await verify(publicKey, await canonicalResponse(200, body, nonce), signature),
+    ).toBe(true);
+
+    const payload = JSON.parse(new TextDecoder().decode(body)) as {
+      platforms: Record<string, { playlists: unknown[]; details: unknown[]; error: string }>;
+    };
+    // 两个平台都没登录：各自带错误，但整体仍是 200，服务端据此跳过该平台。
+    const qq = payload.platforms["qq"];
+    const netease = payload.platforms["netease"];
+    expect(qq?.error).toBe("平台尚未登录");
+    expect(netease?.error).toBe("平台尚未登录");
+    expect(qq?.playlists).toEqual([]);
+  });
 });

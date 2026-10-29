@@ -56,6 +56,8 @@ export interface PlatformStatus {
 export interface AgentStatus {
   apiVersion: number;
   agentVersion: string;
+  /** 可选能力列表；服务端据此启用依赖新接口的功能（如 `library.snapshot`）。 */
+  capabilities?: string[];
   platforms: { qq: PlatformStatus; netease: PlatformStatus };
 }
 

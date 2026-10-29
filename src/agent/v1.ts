@@ -17,7 +17,7 @@ import { Hono, type Context } from "hono";
 import type { AgentIdentity } from "./oauth";
 import { agentSummary } from "./oauth";
 import type { AgentStore } from "./store";
-import type { Platform } from "../shared/types";
+import type { AgentPlaylist, AgentPlaylistDetail, AgentTrack, Platform } from "../shared/types";
 import {
   fetchDaily as fetchQQDaily,
   fetchFavorites as fetchQQFavorites,
@@ -58,6 +58,12 @@ const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
 const NONCE_RETENTION_SECONDS = 10 * 60;
 const MAX_REQUEST_BODY = 64 * 1024;
+/** 快照一次最多带多少张歌单的曲目：服务端按批补齐，避免一次调用打爆上游。 */
+const SNAPSHOT_MAX_IDS = 20;
+/** 快照内并发拉详情与收藏的数目；Cloudflare 子请求有上限，不要开太大。 */
+const SNAPSHOT_CONCURRENCY = 4;
+/** `/v1/status` 的能力清单：服务端据此判断能不能走批量快照。 */
+const CAPABILITIES = ["library.snapshot"];
 
 type Variables = { requestNonce: string };
 
@@ -75,6 +81,7 @@ export function createV1App(store: AgentStore, identity: AgentIdentity) {
     return signedJSON(c, identity, 200, {
       apiVersion: AGENT_API_VERSION,
       agentVersion: AGENT_VERSION,
+      capabilities: CAPABILITIES,
       platforms: {
         qq: publicPlatform(platformView(store, "qq")),
         netease: publicPlatform(platformView(store, "netease")),
@@ -120,6 +127,38 @@ export function createV1App(store: AgentStore, identity: AgentIdentity) {
       return fetchNeteaseFavorites(new NeteaseClient(credential), limit);
     });
     return signedJSON(c, identity, 200, { items, hasMore: false, nextOffset: items.length });
+  });
+
+  /**
+   * 批量快照：一次往返拿回歌单列表、收藏，以及指定歌单的曲目。
+   *
+   * wow-server 侧会把结果落库预加载（`internal/features/agent/library_snapshot.go`）：
+   * 面板与客户端读快照秒回，后台按分钟刷新。`ids` 为空时只取列表，用于常规刷新；
+   * 带 `ids` 时才并发拉这几张歌单的曲目（上限 20 张）。
+   *
+   * 单个平台失败不影响另一个平台：失败信息放在该平台的 `error` 里，服务端只跳过
+   * 那一块并在下一轮重试。
+   */
+  app.get("/v1/library/snapshot", async (c) => {
+    const requested = (c.req.query("platform") ?? "all").trim();
+    let platforms: Platform[];
+    if (requested === "all") {
+      platforms = ["qq", "netease"];
+    } else if (requested === "qq" || requested === "netease") {
+      platforms = [requested];
+    } else {
+      throw badRequest("platform 参数无效");
+    }
+    const limit = parseLimit(c);
+    const trackLimit = parseTrackLimit(c);
+    const ids = requested === "all" ? [] : parseSnapshotIDs(c.req.query("ids"));
+    const result: Record<string, SnapshotPlatform> = {};
+    await Promise.all(
+      platforms.map(async (platform) => {
+        result[platform] = await platformSnapshot(store, platform, limit, trackLimit, ids);
+      }),
+    );
+    return signedJSON(c, identity, 200, { platforms: result });
   });
 
   app.get("/v1/recommend/daily", async (c) => {
@@ -315,12 +354,126 @@ function parseGuessStyle(c: Context): string {
   }
 }
 
-function parseLimit(c: Context): number {  const raw = c.req.query("limit") ?? "";
+function parseLimit(c: Context): number {
+  const raw = c.req.query("limit") ?? "";
   const value = Number.parseInt(raw, 10);
   if (!Number.isFinite(value) || value <= 0) {
     return DEFAULT_LIMIT;
   }
   return Math.min(value, MAX_LIMIT);
+}
+
+/** 快照里的每张歌单取多少首；缺省 100，最多 200。 */
+function parseTrackLimit(c: Context): number {
+  const raw = c.req.query("trackLimit") ?? "";
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    return DEFAULT_LIMIT;
+  }
+  return Math.min(value, MAX_LIMIT);
+}
+
+/** 解析 `ids=a,b,c`。去重、截断到 SNAPSHOT_MAX_IDS，非法项直接跳过。 */
+function parseSnapshotIDs(raw: string | undefined): string[] {
+  if (!raw) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const part of raw.split(",")) {
+    const id = part.trim();
+    if (id === "" || id.length > 128 || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= SNAPSHOT_MAX_IDS) {
+      break;
+    }
+  }
+  return ids;
+}
+
+interface SnapshotPlatform {
+  playlists: AgentPlaylist[];
+  favorites: AgentTrack[];
+  details: AgentPlaylistDetail[];
+  /** 平台级失败（未登录/会话失效）。空串表示这个平台的数据可用。 */
+  error: string;
+}
+
+/**
+ * 拉一个平台的快照。整体失败（未登录、凭证失效）时只回 `error`，不抛异常——
+ * 另一个平台与后续的签名响应都要照常返回。
+ *
+ * 收藏失败降级为空数组：它不影响歌单同步，下一轮会重新取。
+ */
+async function platformSnapshot(
+  store: AgentStore,
+  platform: Platform,
+  limit: number,
+  trackLimit: number,
+  ids: string[],
+): Promise<SnapshotPlatform> {
+  try {
+    return await withPlatform(store, platform, async (credential) => {
+      const detail = async (id: string): Promise<AgentPlaylistDetail | null> => {
+        try {
+          return platform === "qq"
+            ? await fetchQQPlaylistDetail(new QQClient(credential), id, trackLimit)
+            : await fetchNeteasePlaylistDetail(new NeteaseClient(credential), id, trackLimit);
+        } catch {
+          // 单张歌单失败（被删/上游限流）不让整批失败，服务端下一轮会再要。
+          return null;
+        }
+      };
+      const [playlists, favorites, details] = await Promise.all([
+        platform === "qq"
+          ? fetchQQPlaylists(new QQClient(credential), limit)
+          : fetchNeteasePlaylists(new NeteaseClient(credential), limit),
+        (platform === "qq"
+          ? fetchQQFavorites(new QQClient(credential), limit)
+          : fetchNeteaseFavorites(new NeteaseClient(credential), limit)
+        ).catch(() => [] as AgentTrack[]),
+        mapLimit(ids, SNAPSHOT_CONCURRENCY, detail),
+      ]);
+      return {
+        playlists,
+        favorites,
+        details: details.filter((item): item is AgentPlaylistDetail => item !== null),
+        error: "",
+      };
+    });
+  } catch (error) {
+    return {
+      playlists: [],
+      favorites: [],
+      details: [],
+      error: error instanceof AgentError ? error.publicMessage : "平台调用失败",
+    };
+  }
+}
+
+/** 并发受限的 map：保持结果顺序，最多 limit 个同时在飞。 */
+async function mapLimit<T, R>(items: T[], limit: number, run: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) {
+        return;
+      }
+      const item = items[index];
+      if (item === undefined) {
+        continue;
+      }
+      results[index] = await run(item);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function withPlatform<T>(
