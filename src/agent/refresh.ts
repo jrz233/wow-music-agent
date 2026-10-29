@@ -27,6 +27,30 @@ export interface RefreshSummary {
   degraded: Platform[];
 }
 
+/**
+ * 该平台此刻是否需要刷新。
+ *
+ * 除了临期，**刷新成功本身也会滑动有效期**（QQ 每次续期重新给 30 天），所以
+ * 平时也要按 `MAX_INTERVAL_SECONDS` 滚动续一次：只在临期前才动手的话，长期
+ * 不打开面板的账号会在 30 天后直接掉线，面板上的「下次自动刷新」也就成了空话。
+ */
+export function platformDue(
+  row: StoredPlatform | null,
+  now = Math.floor(Date.now() / 1000),
+): boolean {
+  if (!row || row.status === "logged_out") {
+    return false;
+  }
+  if (row.status === "degraded") {
+    return true;
+  }
+  if (row.expiresAt === 0 || row.expiresAt - REFRESH_AHEAD_SECONDS <= now) {
+    return true;
+  }
+  // 旧数据没有刷新时间：先探一次，避免一直等到 30 天后才发现失效。
+  return row.lastRefreshAt <= 0 || now - row.lastRefreshAt >= MAX_INTERVAL_SECONDS;
+}
+
 /** 刷新所有**已到期**的平台会话；返回下一次需要唤醒的时间（秒），无会话返回 null。 */
 export async function refreshDue(store: AgentStore, now = Math.floor(Date.now() / 1000)): Promise<{
   summary: RefreshSummary;
@@ -35,14 +59,7 @@ export async function refreshDue(store: AgentStore, now = Math.floor(Date.now() 
   const summary: RefreshSummary = { refreshed: [], loggedOut: [], degraded: [] };
   for (const platform of PLATFORMS) {
     const row = store.platform(platform);
-    if (!row || row.status === "logged_out") {
-      continue;
-    }
-    const due =
-      row.status === "degraded" ||
-      row.expiresAt === 0 ||
-      row.expiresAt - REFRESH_AHEAD_SECONDS <= now;
-    if (!due) {
+    if (!row || !platformDue(row, now)) {
       continue;
     }
     await refreshOne(store, platform, row, summary, now);
@@ -60,12 +77,16 @@ export function platformNextRefreshAt(
   if (!row || row.status === "logged_out") {
     return null;
   }
-  return row.status === "degraded"
-    ? now + DEGRADED_BACKOFF_SECONDS
-    : Math.min(
-        row.expiresAt > 0 ? row.expiresAt - REFRESH_AHEAD_SECONDS : now + MAX_INTERVAL_SECONDS,
-        now + MAX_INTERVAL_SECONDS,
-      );
+  if (row.status === "degraded") {
+    return now + DEGRADED_BACKOFF_SECONDS;
+  }
+  // 与 platformDue 的三个条件一一对应：没记录 / 未知到期时间 → 立刻安排。
+  if (row.lastRefreshAt <= 0 || row.expiresAt === 0) {
+    return now;
+  }
+  const probeAt = row.lastRefreshAt + MAX_INTERVAL_SECONDS;
+  const expiryAt = row.expiresAt - REFRESH_AHEAD_SECONDS;
+  return Math.min(probeAt, expiryAt);
 }
 
 /** 登录成功后立刻安排一次刷新；调用方负责 `storage.setAlarm`。 */
