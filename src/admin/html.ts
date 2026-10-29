@@ -68,7 +68,19 @@ export function loginPage(nonce: string, message: string, serverUrl: string): st
       </form>
       <p class="muted small">登录会跳转到你的 wow-server，用本站账号确认授权后自动返回。
       本 Agent 不保存任何平台账号或密码。</p>
-    </main>`,
+    </main>
+    <script nonce="${nonce}">
+    (function () {
+      var form = document.querySelector('form[method="post"]');
+      if (!form) return;
+      form.addEventListener('submit', function () {
+        var button = form.querySelector('button[type="submit"]');
+        if (!button) return;
+        button.disabled = true;
+        button.textContent = '正在跳转…';
+      });
+    })();
+    </script>`,
   );
 }
 
@@ -106,7 +118,6 @@ export function dashboardPage(options: {
   const { nonce, csrf, platforms, paired, message } = options;
   const cards = platforms.map((platform) => platformCard(platform, csrf)).join("");
   const banner = message ? `<p class="notice">${escapeHtml(message)}</p>` : "";
-  const showTimezone = paired.paired || platforms.some((platform) => platform.loggedIn);
 
   const pairBox = paired.paired
     ? `<div class="card">
@@ -117,7 +128,7 @@ export function dashboardPage(options: {
           <dt>公钥指纹</dt><dd><code>${escapeHtml(paired.fingerprint)}</code></dd>
           <dt>连接时间</dt><dd>${formatTime(paired.pairedAt)}</dd>
         </dl>
-        <form method="post" action="/admin/unpair" class="inline">
+        <form method="post" action="/admin/unpair" class="inline" data-ajax data-busy="正在解除…">
           <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
           <button type="submit" class="danger">解除绑定</button>
         </form>
@@ -135,7 +146,6 @@ export function dashboardPage(options: {
     `${chrome("概览", csrf, true)}
     <main>
       ${banner}
-      ${showTimezone ? `<p class="muted small timezone">时间均为北京时间（UTC+8）。</p>` : ""}
       <div class="grid">${cards}</div>
       ${pairBox}
       <div class="card muted-card">
@@ -149,11 +159,15 @@ export function dashboardPage(options: {
 }
 
 /**
- * 卡片的就地登录：点「扫码登录」→ 取二维码 → 轮询状态 → 成功后整页刷新。
+ * 管理页的全部交互都走 fetch，不整页跳转。
  *
- * 以前二维码在独立页面，登录后从导航再点一次平台名又会重新走一遍扫码，看起来像
- * 「登录失效」。现在入口只有卡片下方这一处，状态轮询也只在当前卡片里。
- * 脚本走 nonce，不依赖任何内联事件属性。
+ * - 服务平台类操作（刷新令牌、退出平台）与解绑：提交后用响应里的 HTML 就地替换
+ *   `<main>` 和 `<header>`，地址栏同步成带 message 的地址，按钮在请求期间显示进行中。
+ * - 连接 wow-server：成功后拿到中转页，再跳去 wow-server 授权（跨站，无法避免）。
+ * - 扫码登录：二维码就地展开、轮询状态，成功后重新拉取概览而不是刷新整页。
+ *
+ * 替换后的 DOM 要重新绑定事件，所以入口统一放在 `ready()`。脚本走 nonce，不依赖
+ * 任何内联事件属性。
  */
 const DASHBOARD_SCRIPT = `
 (function () {
@@ -168,11 +182,11 @@ const DASHBOARD_SCRIPT = `
     return document.querySelector('[data-login="' + platform + '"]');
   }
 
-  function setLoginButton(platform, busy) {
+  function setLoginButton(platform, busy, label) {
     var button = loginButton(platform);
     if (!button) return;
     button.disabled = busy;
-    button.textContent = busy ? '二维码已显示' : '扫码登录';
+    button.textContent = busy ? (label || '二维码已显示') : '扫码登录';
   }
 
   function text(tag, className, value) {
@@ -220,7 +234,8 @@ const DASHBOARD_SCRIPT = `
           if (data.state === 'success') {
             if (status) status.textContent = '登录成功，正在刷新…';
             if (qr) qr.classList.add('done');
-            setTimeout(function () { location.reload(); }, 700);
+            generation[platform] += 1;
+            setTimeout(refreshDashboard, 700);
             return;
           }
           if (data.state === 'scanned') {
@@ -257,7 +272,7 @@ const DASHBOARD_SCRIPT = `
     slot.hidden = false;
     slot.innerHTML = '';
     slot.appendChild(text('p', 'muted small', '正在获取二维码…'));
-    setLoginButton(platform, true);
+    setLoginButton(platform, true, '正在获取二维码…');
     fetch('/admin/api/' + platform + '/qr', { cache: 'no-store' })
       .then(function (response) {
         return response.json().then(function (data) {
@@ -280,6 +295,7 @@ const DASHBOARD_SCRIPT = `
         status.setAttribute('data-status', '');
         slot.appendChild(status);
         slot.appendChild(text('p', 'muted small', '二维码由本 Agent 服务端获取。'));
+        setLoginButton(platform, true);
         poll(platform, slot, token);
       })
       .catch(function () {
@@ -288,14 +304,150 @@ const DASHBOARD_SCRIPT = `
       });
   }
 
-  var buttons = document.querySelectorAll('[data-login]');
-  for (var index = 0; index < buttons.length; index += 1) {
-    (function (button) {
-      var platform = button.getAttribute('data-login');
-      if (!platform) return;
-      button.addEventListener('click', function () { start(platform); });
-    })(buttons[index]);
+  /** 用服务端渲染的新 HTML 就地替换页面骨架，不触发整页加载。 */
+  function swap(html, url) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var freshMain = doc.querySelector('main');
+    var main = document.querySelector('main');
+    if (!freshMain || !main) {
+      location.reload();
+      return;
+    }
+    // 旧页面上可能还有轮询在跑，换 DOM 前先让它们失效。
+    for (var platform in generation) {
+      if (Object.prototype.hasOwnProperty.call(generation, platform)) {
+        generation[platform] += 1;
+      }
+    }
+    for (var pending in timers) {
+      if (Object.prototype.hasOwnProperty.call(timers, pending) && timers[pending]) {
+        clearTimeout(timers[pending]);
+        timers[pending] = null;
+      }
+    }
+    var freshHeader = doc.querySelector('header');
+    var header = document.querySelector('header');
+    if (freshHeader && header) header.replaceWith(freshHeader);
+    main.replaceWith(freshMain);
+    if (url) history.replaceState(null, '', url.pathname + url.search);
+    ready();
   }
+
+  /** 重新拉取概览；扫码成功、操作完成后都用它，避免整页刷新。 */
+  function refreshDashboard() {
+    fetch('/admin', { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (response) {
+        var finalUrl = new URL(response.url, location.href);
+        if (finalUrl.pathname === '/admin/login') {
+          location.assign('/admin/login');
+          return null;
+        }
+        if (!response.ok) throw new Error('bad response');
+        return response.text();
+      })
+      .then(function (html) {
+        if (html) swap(html, null);
+      })
+      .catch(function () {
+        location.reload();
+      });
+  }
+
+  function errorNote(form, message) {
+    var note = document.createElement('p');
+    note.className = 'error small';
+    note.textContent = message;
+    form.parentNode.insertBefore(note, form.nextSibling);
+    setTimeout(function () {
+      if (note.parentNode) note.parentNode.removeChild(note);
+    }, 4000);
+  }
+
+  /**
+   * 表单的无感提交：按钮先进入进行中，再把响应里的页面骨架换进来。
+   *
+   * 服务端的 POST 都回 303 到 /admin?message=…；fetch 自动跟随，拿到的就是带
+   * 消息横幅的整页 HTML。连接 wow-server 例外——那一步要跨站去授权，只能读取
+   * 中转页里的 meta refresh 地址再跳转。
+   */
+  function submit(form, button) {
+    if (form.getAttribute('data-busy-active') === '1') return;
+    form.setAttribute('data-busy-active', '1');
+    var original = button ? button.textContent : '';
+    if (button) {
+      button.disabled = true;
+      button.textContent = form.getAttribute('data-busy') || '处理中…';
+    }
+    var body = new URLSearchParams();
+    new FormData(form).forEach(function (value, key) {
+      body.append(key, String(value));
+    });
+    fetch(form.action, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    })
+      .then(function (response) {
+        var finalUrl = new URL(response.url, location.href);
+        return response.text().then(function (text) {
+          return { response: response, text: text, finalUrl: finalUrl };
+        });
+      })
+      .then(function (result) {
+        if (result.finalUrl.pathname === '/admin/login') {
+          location.assign('/admin/login');
+          return;
+        }
+        var doc = new DOMParser().parseFromString(result.text, 'text/html');
+        var meta = doc.querySelector('meta[http-equiv="refresh"]');
+        if (meta) {
+          var match = /url=(.*)$/i.exec(meta.getAttribute('content') || '');
+          if (match) {
+            location.assign(match[1]);
+            return;
+          }
+        }
+        var freshMain = doc.querySelector('main');
+        if (freshMain) {
+          var target = result.finalUrl.pathname === '/admin' ? result.finalUrl : null;
+          swap(result.text, target);
+          return;
+        }
+        if (!result.response.ok) throw new Error('request failed');
+        location.reload();
+      })
+      .catch(function () {
+        form.removeAttribute('data-busy-active');
+        if (button) {
+          button.disabled = false;
+          button.textContent = original;
+        }
+        errorNote(form, '网络异常，请重试');
+      });
+  }
+
+  function ready() {
+    var buttons = document.querySelectorAll('[data-login]');
+    for (var index = 0; index < buttons.length; index += 1) {
+      (function (button) {
+        var platform = button.getAttribute('data-login');
+        if (!platform) return;
+        button.addEventListener('click', function () { start(platform); });
+      })(buttons[index]);
+    }
+    var forms = document.querySelectorAll('form[data-ajax]');
+    for (var position = 0; position < forms.length; position += 1) {
+      (function (form) {
+        form.addEventListener('submit', function (event) {
+          event.preventDefault();
+          submit(form, form.querySelector('button[type="submit"], button:not([type])'));
+        });
+      })(forms[position]);
+    }
+  }
+
+  ready();
 })();
 `;
 
@@ -305,7 +457,7 @@ const DASHBOARD_SCRIPT = `
  * 与登录页的同名输入相比，这里带 CSRF 并走会话校验；提交后同样落到中转页。
  */
 function authorizeForm(csrf: string, serverUrl: string): string {
-  return `<form method="post" action="/admin/connect">
+  return `<form method="post" action="/admin/connect" data-ajax data-busy="正在连接…">
     <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
     <label>wow-server 地址
       <input name="serverUrl" type="url" value="${escapeHtml(serverUrl)}"
@@ -336,11 +488,11 @@ function platformCard(platform: PlatformView, csrf: string): string {
       </dl>
       <p class="muted small">令牌由后台定时自动续期，通常无需手动操作。</p>
       <div class="actions">
-        <form method="post" action="/admin/api/platform/${platform.platform}/refresh">
+        <form method="post" action="/admin/api/platform/${platform.platform}/refresh" data-ajax data-busy="正在刷新…">
           <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
           <button type="submit" class="secondary">立即刷新令牌</button>
         </form>
-        <form method="post" action="/admin/api/platform/${platform.platform}/logout">
+        <form method="post" action="/admin/api/platform/${platform.platform}/logout" data-ajax data-busy="正在退出…">
           <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
           <button type="submit" class="danger">退出登录</button>
         </form>
@@ -379,7 +531,7 @@ function chrome(active: string, csrf: string, authenticated: boolean): string {
     ? `<nav>
         <a href="/admin" class="${active === "概览" ? "active" : ""}">概览</a>
       </nav>
-      <form method="post" action="/admin/logout" class="logout">
+      <form method="post" action="/admin/logout" class="logout" data-ajax data-busy="正在退出…">
         <input type="hidden" name="_csrf" value="${csrf}">
         <button type="submit" class="link">退出</button>
       </form>`
@@ -492,7 +644,6 @@ form.inline { display: inline; }
 form.logout { margin-left: auto; }
 .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
 .actions form { margin: 0; }
-.timezone { margin: 0 0 4px; }
 .qr-slot { margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--line); text-align: center; }
 .qr-slot .qr { margin: 12px auto 8px; }
 .qr-slot button { margin-top: 8px; }
