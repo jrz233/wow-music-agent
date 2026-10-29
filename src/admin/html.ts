@@ -14,6 +14,8 @@ export interface PlatformView {
   avatarUrl: string;
   expiresAt: number;
   lastRefreshAt: number;
+  /** 下一次自动刷新的时刻；0 表示没有可刷新的会话。 */
+  nextRefreshAt: number;
   lastError: string;
 }
 
@@ -104,6 +106,7 @@ export function dashboardPage(options: {
   const { nonce, csrf, platforms, paired, message } = options;
   const cards = platforms.map((platform) => platformCard(platform, csrf)).join("");
   const banner = message ? `<p class="notice">${escapeHtml(message)}</p>` : "";
+  const showTimezone = paired.paired || platforms.some((platform) => platform.loggedIn);
 
   const pairBox = paired.paired
     ? `<div class="card">
@@ -132,6 +135,7 @@ export function dashboardPage(options: {
     `${chrome("概览", csrf, true)}
     <main>
       ${banner}
+      ${showTimezone ? `<p class="muted small timezone">时间均为北京时间（UTC+8）。</p>` : ""}
       <div class="grid">${cards}</div>
       ${pairBox}
       <div class="card muted-card">
@@ -139,77 +143,161 @@ export function dashboardPage(options: {
         <p>平台令牌只保存在本 Agent 的 Durable Object 中，并使用 AES-256-GCM 加密。wow-server
         只能读取歌单、收藏、每日推荐与漫游，永远拿不到令牌。</p>
       </div>
-    </main>`,
+    </main>
+    <script nonce="${nonce}">${DASHBOARD_SCRIPT}</script>`,
   );
 }
 
-export function qrPage(options: {
-  nonce: string;
-  csrf: string;
-  platform: "qq" | "netease";
-  imageDataUrl: string;
-  nickname: string;
-}): string {
-  const { nonce, csrf, platform, imageDataUrl, nickname } = options;
-  const label = PLATFORM_LABEL[platform];
-  const title = nickname ? `${label}：${nickname}` : `登录 ${label}`;
-  const script = `
-    const status = document.getElementById('status');
-    const hint = document.getElementById('hint');
-    const qr = document.getElementById('qr');
-    let stopped = false;
-    async function poll() {
-      if (stopped) return;
-      try {
-        const response = await fetch('/admin/api/${platform}/status', { cache: 'no-store' });
-        const data = await response.json();
-        if (data.state === 'success') {
-          stopped = true;
-          status.textContent = '登录成功，正在返回…';
-          if (qr) qr.classList.add('done');
-          setTimeout(() => { location.href = '/admin'; }, 600);
+/**
+ * 卡片的就地登录：点「扫码登录」→ 取二维码 → 轮询状态 → 成功后整页刷新。
+ *
+ * 以前二维码在独立页面，登录后从导航再点一次平台名又会重新走一遍扫码，看起来像
+ * 「登录失效」。现在入口只有卡片下方这一处，状态轮询也只在当前卡片里。
+ * 脚本走 nonce，不依赖任何内联事件属性。
+ */
+const DASHBOARD_SCRIPT = `
+(function () {
+  var generation = {};
+  var timers = {};
+
+  function slotOf(platform) {
+    return document.querySelector('[data-slot="' + platform + '"]');
+  }
+
+  function loginButton(platform) {
+    return document.querySelector('[data-login="' + platform + '"]');
+  }
+
+  function setLoginButton(platform, busy) {
+    var button = loginButton(platform);
+    if (!button) return;
+    button.disabled = busy;
+    button.textContent = busy ? '二维码已显示' : '扫码登录';
+  }
+
+  function text(tag, className, value) {
+    var node = document.createElement(tag);
+    node.className = className;
+    node.textContent = value;
+    return node;
+  }
+
+  function reset(platform, message) {
+    var slot = slotOf(platform);
+    if (!slot) return;
+    slot.innerHTML = '';
+    slot.appendChild(text('p', 'error small', message));
+    var again = document.createElement('button');
+    again.type = 'button';
+    again.className = 'secondary';
+    again.textContent = '重新获取二维码';
+    again.addEventListener('click', function () { start(platform); });
+    slot.appendChild(again);
+    setLoginButton(platform, false);
+  }
+
+  function stop(platform, token) {
+    if (generation[platform] !== token) return false;
+    if (timers[platform]) {
+      clearTimeout(timers[platform]);
+      timers[platform] = null;
+    }
+    return true;
+  }
+
+  function poll(platform, slot, token) {
+    var status = slot.querySelector('[data-status]');
+    var qr = slot.querySelector('img.qr');
+    function tick() {
+      if (!stop(platform, token)) return;
+      timers[platform] = null;
+      fetch('/admin/api/' + platform + '/status', { cache: 'no-store' })
+        .then(function (response) {
+          return response.json();
+        })
+        .then(function (data) {
+          if (!stop(platform, token)) return;
+          if (data.state === 'success') {
+            if (status) status.textContent = '登录成功，正在刷新…';
+            if (qr) qr.classList.add('done');
+            setTimeout(function () { location.reload(); }, 700);
+            return;
+          }
+          if (data.state === 'scanned') {
+            if (status) status.textContent = '已扫码，请在手机上确认';
+          } else if (data.state === 'expired') {
+            reset(platform, '二维码已过期');
+            return;
+          } else if (data.state === 'error') {
+            reset(platform, data.message || '登录失败，请重试');
+            return;
+          } else if (status) {
+            status.textContent = '等待扫码…';
+          }
+          timers[platform] = setTimeout(tick, 2000);
+        })
+        .catch(function () {
+          if (!stop(platform, token)) return;
+          if (status) status.textContent = '网络异常，稍后重试…';
+          timers[platform] = setTimeout(tick, 3000);
+        });
+    }
+    timers[platform] = setTimeout(tick, 500);
+  }
+
+  function start(platform) {
+    var slot = slotOf(platform);
+    if (!slot) return;
+    generation[platform] = (generation[platform] || 0) + 1;
+    var token = generation[platform];
+    if (timers[platform]) {
+      clearTimeout(timers[platform]);
+      timers[platform] = null;
+    }
+    slot.hidden = false;
+    slot.innerHTML = '';
+    slot.appendChild(text('p', 'muted small', '正在获取二维码…'));
+    setLoginButton(platform, true);
+    fetch('/admin/api/' + platform + '/qr', { cache: 'no-store' })
+      .then(function (response) {
+        return response.json().then(function (data) {
+          return { ok: response.ok, data: data };
+        });
+      })
+      .then(function (result) {
+        if (!stop(platform, token)) return;
+        if (!result.ok || !result.data || !result.data.imageDataUrl) {
+          reset(platform, (result.data && result.data.message) || '获取二维码失败，请重试');
           return;
         }
-        if (data.state === 'scanned') { status.textContent = '已扫码，请在手机上确认'; }
-        else if (data.state === 'expired') {
-          stopped = true;
-          status.textContent = '二维码已过期';
-          hint.innerHTML = '<a class="button" href="/admin/${platform}">刷新二维码</a>';
-          if (qr) qr.classList.add('expired');
-          return;
-        } else if (data.state === 'error') {
-          // 失败原因必须显示出来：以前一律显示「等待扫码」，扫码成功却换票失败时
-          // 用户只看到「等待扫码」，完全不知道卡在哪一步。
-          stopped = true;
-          status.textContent = data.message || '登录失败，请重试';
-          hint.innerHTML = '<a class="button" href="/admin/${platform}">重新获取二维码</a>';
-          return;
-        } else { status.textContent = '等待扫码…'; }
-      } catch (error) {
-        status.textContent = '网络异常，稍后重试…';
-      }
-      setTimeout(poll, 2000);
-    }
-    setTimeout(poll, 800);
-  `;
-  return layout(
-    title,
-    nonce,
-    `${chrome("登录", csrf, true)}
-    <main class="narrow">
-      <div class="card center">
-        <div class="row"><h2>登录 ${escapeHtml(label)}</h2><span class="pill">扫码</span></div>
-        <p class="muted">使用 ${escapeHtml(label)} App 扫描二维码。</p>
-        <img id="qr" class="qr" src="${escapeHtml(imageDataUrl)}" alt="${escapeHtml(label)} 登录二维码">
-        <p id="status" class="status">等待扫码…</p>
-        <p id="hint" class="muted small"></p>
-        <p class="muted small">二维码由本 Agent 服务端抓取，不会把图片域名加入页面 CSP。</p>
-      </div>
-      <a class="back" href="/admin">← 返回概览</a>
-    </main>
-    <script nonce="${nonce}">${script}</script>`,
-  );
-}
+        slot.innerHTML = '';
+        var image = document.createElement('img');
+        image.className = 'qr';
+        image.alt = '登录二维码';
+        image.src = result.data.imageDataUrl;
+        slot.appendChild(image);
+        var status = text('p', 'status', '等待扫码…');
+        status.setAttribute('data-status', '');
+        slot.appendChild(status);
+        slot.appendChild(text('p', 'muted small', '二维码由本 Agent 服务端获取。'));
+        poll(platform, slot, token);
+      })
+      .catch(function () {
+        if (!stop(platform, token)) return;
+        reset(platform, '网络异常，请重试');
+      });
+  }
+
+  var buttons = document.querySelectorAll('[data-login]');
+  for (var index = 0; index < buttons.length; index += 1) {
+    (function (button) {
+      var platform = button.getAttribute('data-login');
+      if (!platform) return;
+      button.addEventListener('click', function () { start(platform); });
+    })(buttons[index]);
+  }
+})();
+`;
 
 /**
  * 已登录后的「连接 wow-server」表单。
@@ -232,23 +320,36 @@ function authorizeForm(csrf: string, serverUrl: string): string {
 
 function platformCard(platform: PlatformView, csrf: string): string {
   const label = PLATFORM_LABEL[platform.platform];
+  const token = tokenState(platform);
   const badge = platform.loggedIn
-    ? `<span class="pill ok">在线</span>`
-    : platform.status === "degraded"
-      ? `<span class="pill warn">降级</span>`
-      : `<span class="pill">未登录</span>`;
+    ? platform.status === "degraded"
+      ? `<span class="pill warn">刷新失败</span>`
+      : `<span class="pill ok">已登录</span>`
+    : `<span class="pill">未登录</span>`;
   const detail = platform.loggedIn
     ? `<dl>
         <dt>账号</dt><dd>${escapeHtml(platform.nickname || platform.accountId || "—")}</dd>
+        <dt>令牌状态</dt><dd><span class="pill ${token.tone}">${token.label}</span></dd>
+        <dt>有效期至</dt><dd>${platform.expiresAt ? formatTime(platform.expiresAt) : "由平台决定"}</dd>
         <dt>最近刷新</dt><dd>${platform.lastRefreshAt ? formatTime(platform.lastRefreshAt) : "—"}</dd>
-        <dt>预计到期</dt><dd>${platform.expiresAt ? formatTime(platform.expiresAt) : "—"}</dd>
+        <dt>下次自动刷新</dt><dd>${platform.nextRefreshAt ? formatTime(platform.nextRefreshAt) : "等待安排"}</dd>
       </dl>
-      <form method="post" action="/admin/api/platform/${platform.platform}/logout" class="inline">
-        <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
-        <button type="submit" class="secondary">退出登录</button>
-      </form>`
+      <p class="muted small">令牌由后台定时自动续期，通常无需手动操作。</p>
+      <div class="actions">
+        <form method="post" action="/admin/api/platform/${platform.platform}/refresh">
+          <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+          <button type="submit" class="secondary">立即刷新令牌</button>
+        </form>
+        <form method="post" action="/admin/api/platform/${platform.platform}/logout">
+          <input type="hidden" name="_csrf" value="${escapeHtml(csrf)}">
+          <button type="submit" class="danger">退出登录</button>
+        </form>
+      </div>`
     : `<p class="muted">扫码后即可读取该平台的歌单、收藏、每日推荐与漫游。</p>
-      <a class="button primary" href="/admin/${platform.platform}">扫码登录</a>`;
+      <div class="actions">
+        <button type="button" class="primary" data-login="${platform.platform}">扫码登录</button>
+      </div>
+      <div class="qr-slot" data-slot="${platform.platform}" hidden></div>`;
   const error = platform.lastError
     ? `<p class="error small">${escapeHtml(platform.lastError)}</p>`
     : "";
@@ -259,12 +360,24 @@ function platformCard(platform: PlatformView, csrf: string): string {
   </div>`;
 }
 
+/** 令牌是否还可用的粗略判断；真正的续期由 alarm 自动完成。 */
+function tokenState(platform: PlatformView): { tone: string; label: string } {
+  if (platform.status === "degraded") {
+    return { tone: "warn", label: "刷新失败" };
+  }
+  if (!platform.expiresAt) {
+    return { tone: "ok", label: "自动续期" };
+  }
+  if (platform.expiresAt <= Math.floor(Date.now() / 1000)) {
+    return { tone: "warn", label: "可能已过期" };
+  }
+  return { tone: "ok", label: "有效" };
+}
+
 function chrome(active: string, csrf: string, authenticated: boolean): string {
   const navigation = authenticated
     ? `<nav>
         <a href="/admin" class="${active === "概览" ? "active" : ""}">概览</a>
-        <a href="/admin/qq" class="${active === "QQ 音乐" ? "active" : ""}">QQ 音乐</a>
-        <a href="/admin/netease" class="${active === "网易云音乐" ? "active" : ""}">网易云音乐</a>
       </nav>
       <form method="post" action="/admin/logout" class="logout">
         <input type="hidden" name="_csrf" value="${csrf}">
@@ -293,9 +406,15 @@ ${body}
 </html>`;
 }
 
+/** 北京时间（UTC+8），不依赖运行环境的时区设置。 */
 function formatTime(seconds: number): string {
   if (!seconds) return "—";
-  return new Date(seconds * 1000).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  const shifted = new Date((seconds + 8 * 3600) * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}` +
+    ` ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`
+  );
 }
 
 function hostOf(raw: string): string {
@@ -344,7 +463,8 @@ p { margin: 10px 0; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
   padding: 20px; margin: 16px 0; }
 .muted-card p { color: var(--muted); }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.grid > .card { margin: 0; }
 .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .pill { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
   border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
@@ -371,6 +491,13 @@ details.card label { margin-bottom: 0; }
 form.inline { display: inline; }
 form.logout { margin-left: auto; }
 .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.actions form { margin: 0; }
+.timezone { margin: 0 0 4px; }
+.qr-slot { margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--line); text-align: center; }
+.qr-slot .qr { margin: 12px auto 8px; }
+.qr-slot button { margin-top: 8px; }
+[hidden] { display: none !important; }
+button:disabled { opacity: .55; cursor: default; }
 .center { text-align: center; }
 .center .row { justify-content: center; }
 .qr { width: 240px; height: 240px; max-width: 100%; margin: 16px auto; display: block;
@@ -381,9 +508,16 @@ form.logout { margin-left: auto; }
 .notice { background: var(--warn-bg); color: var(--warn); border-radius: 10px; padding: 10px 14px; }
 .back { display: inline-block; margin-top: 12px; color: var(--muted); text-decoration: none; }
 .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
-@media (max-width: 520px) {
+@media (max-width: 600px) {
   header { padding: 12px 16px; gap: 10px; }
+  header .brand { width: 100%; }
+  nav { flex: 1 1 auto; }
+  form.logout { margin-left: auto; }
   main { padding: 20px 16px 48px; }
+  .card { padding: 16px; border-radius: 14px; }
+  dl { grid-template-columns: 88px 1fr; }
+  .actions > form { flex: 1 1 140px; }
+  .actions > form button, .actions > button, .actions > .button { width: 100%; }
   .qr { width: 200px; height: 200px; }
 }
 `;

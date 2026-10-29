@@ -50,21 +50,32 @@ export async function refreshDue(store: AgentStore, now = Math.floor(Date.now() 
   return { summary, nextAt: nextRefreshAt(store, now) };
 }
 
+/** 单个平台下一次该刷新的时刻；未登录返回 null。 */
+export function platformNextRefreshAt(
+  store: AgentStore,
+  platform: Platform,
+  now = Math.floor(Date.now() / 1000),
+): number | null {
+  const row = store.platform(platform);
+  if (!row || row.status === "logged_out") {
+    return null;
+  }
+  return row.status === "degraded"
+    ? now + DEGRADED_BACKOFF_SECONDS
+    : Math.min(
+        row.expiresAt > 0 ? row.expiresAt - REFRESH_AHEAD_SECONDS : now + MAX_INTERVAL_SECONDS,
+        now + MAX_INTERVAL_SECONDS,
+      );
+}
+
 /** 登录成功后立刻安排一次刷新；调用方负责 `storage.setAlarm`。 */
 export function nextRefreshAt(store: AgentStore, now = Math.floor(Date.now() / 1000)): number | null {
   let next: number | null = null;
   for (const platform of PLATFORMS) {
-    const row = store.platform(platform);
-    if (!row || row.status === "logged_out") {
+    const candidate = platformNextRefreshAt(store, platform, now);
+    if (candidate === null) {
       continue;
     }
-    const candidate =
-      row.status === "degraded"
-        ? now + DEGRADED_BACKOFF_SECONDS
-        : Math.min(
-            row.expiresAt > 0 ? row.expiresAt - REFRESH_AHEAD_SECONDS : now + MAX_INTERVAL_SECONDS,
-            now + MAX_INTERVAL_SECONDS,
-          );
     if (next === null || candidate < next) {
       next = candidate;
     }
@@ -73,6 +84,43 @@ export function nextRefreshAt(store: AgentStore, now = Math.floor(Date.now() / 1
     return null;
   }
   return Math.max(next, now + MIN_ALARM_SECONDS);
+}
+
+export interface ManualRefreshResult {
+  state: "ok" | "degraded" | "logged_out" | "missing";
+  message: string;
+  nextAt: number | null;
+}
+
+/**
+ * 手动刷新一个平台：不等到期，立刻用已保存的凭据续期一次。
+ *
+ * 令牌本来就有 alarm 自动刷新；这个入口只是让用户在想确认「令牌还有没有效」
+ * 时不必等下一次 alarm。失败不会往外抛：面板要把原因显示出来，而不是 500。
+ */
+export async function refreshPlatformNow(
+  store: AgentStore,
+  platform: Platform,
+  now = Math.floor(Date.now() / 1000),
+): Promise<ManualRefreshResult> {
+  const row = store.platform(platform);
+  if (!row || row.status === "logged_out") {
+    return {
+      state: "missing",
+      message: "尚未登录，无法刷新令牌",
+      nextAt: nextRefreshAt(store, now),
+    };
+  }
+  const summary: RefreshSummary = { refreshed: [], loggedOut: [], degraded: [] };
+  await refreshOne(store, platform, row, summary, now);
+  const nextAt = nextRefreshAt(store, now);
+  if (summary.loggedOut.length > 0) {
+    return { state: "logged_out", message: "登录已失效，请重新扫码", nextAt };
+  }
+  if (summary.degraded.length > 0) {
+    return { state: "degraded", message: "刷新暂时失败，稍后会自动重试", nextAt };
+  }
+  return { state: "ok", message: "令牌已刷新", nextAt };
 }
 
 async function refreshOne(
@@ -169,6 +217,7 @@ export function platformView(store: AgentStore, platform: Platform) {
       avatarUrl: "",
       expiresAt: 0,
       lastRefreshAt: 0,
+      nextRefreshAt: 0,
       lastError: "",
     };
   }
@@ -181,6 +230,7 @@ export function platformView(store: AgentStore, platform: Platform) {
     avatarUrl: row.avatarUrl,
     expiresAt: row.expiresAt,
     lastRefreshAt: row.lastRefreshAt,
+    nextRefreshAt: platformNextRefreshAt(store, platform) ?? 0,
     lastError: row.lastError,
   };
 }

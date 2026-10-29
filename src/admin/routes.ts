@@ -17,7 +17,12 @@ import {
   startOAuth,
   unpair,
 } from "../agent/oauth";
-import { platformView, nextRefreshAt, storeLogin } from "../agent/refresh";
+import {
+  platformView,
+  nextRefreshAt,
+  refreshPlatformNow,
+  storeLogin,
+} from "../agent/refresh";
 import { redact } from "../agent/redact";
 import type { AgentStore } from "../agent/store";
 import { AgentError, badRequest, forbidden } from "../shared/errors";
@@ -36,7 +41,6 @@ import {
   dashboardPage,
   loginPage,
   oauthRedirectPage,
-  qrPage,
   type PairedView,
   type PlatformView,
 } from "./html";
@@ -154,53 +158,39 @@ export function createAdminApp(
 
   // ---- 扫码登录 -------------------------------------------------------------
 
-  app.get("/admin/qq", async (c) => {
-    const guard = await pageSession(c, store);
-    if (guard instanceof Response) {
-      return guard;
-    }
-    try {
-      const start = await beginQQLogin();
-      // QQ 的 `key` 列存的是入口标识（xui / ssl），不是二维码 key——轮询必须回到
-      // 同一台机器，qrsig 才对得上。
-      store.saveQR("qq", start.endpoint, start.cookie, now());
-      const nonce = newNonce();
-      return html(
-        qrPage({
-          nonce,
-          csrf: guard.csrf,
-          platform: "qq",
-          imageDataUrl: start.imageDataUrl,
-          nickname: platformView(store, "qq").nickname,
-        }),
-        nonce,
-      );
-    } catch (error) {
-      return renderDashboard(c, store, identity, guard.csrf, publicMessage(error));
-    }
-  });
+  // 旧的独立扫码页不再使用：二维码在概览的卡片下方就地展开。收藏了旧地址的
+  // 浏览器仍然能回来，但不会再从导航误触一次「重新扫码」。
+  app.get("/admin/qq", (c) => redirect("/admin"));
+  app.get("/admin/netease", (c) => redirect("/admin"));
 
-  app.get("/admin/netease", async (c) => {
+  /**
+   * 就地获取二维码。返回 JSON 而不是整页：页面拿到后插到卡片下方并开始轮询，
+   * 登录成功后整页刷新，卡片自然变成已登录状态。
+   */
+  app.get("/admin/api/:platform/qr", async (c) => {
     const guard = await pageSession(c, store);
     if (guard instanceof Response) {
-      return guard;
+      return json({ message: "登录已过期，请刷新页面" }, 401);
+    }
+    const platform = c.req.param("platform");
+    if (platform !== "qq" && platform !== "netease") {
+      return json({ message: "平台无效" }, 400);
     }
     try {
+      if (platform === "qq") {
+        const start = await beginQQLogin();
+        // QQ 的 `key` 列存的是入口标识（xui / ssl），不是二维码 key——轮询必须回到
+        // 同一台机器，qrsig 才对得上。
+        store.saveQR("qq", start.endpoint, start.cookie, now());
+        return json({ imageDataUrl: start.imageDataUrl });
+      }
       const start = await beginNeteaseLogin();
       store.saveQR("netease", start.key, start.cookie, now());
-      const nonce = newNonce();
-      return html(
-        qrPage({
-          nonce,
-          csrf: guard.csrf,
-          platform: "netease",
-          imageDataUrl: start.imageDataUrl,
-          nickname: platformView(store, "netease").nickname,
-        }),
-        nonce,
-      );
+      return json({ imageDataUrl: start.imageDataUrl });
     } catch (error) {
-      return renderDashboard(c, store, identity, guard.csrf, publicMessage(error));
+      const message = publicMessage(error);
+      console.error(`${platform} qr failed`, { message, detail: redact(error) });
+      return json({ message }, 502);
     }
   });
 
@@ -258,6 +248,20 @@ export function createAdminApp(
       console.error("netease login poll failed", { message, detail: redact(error) });
       return json({ state: "error", message }, 502);
     }
+  });
+
+  // 手动续期一次。令牌本来就有 alarm 自动刷新，这里只是让用户能立刻确认
+  // 「令牌还有没有效」，失败原因也走同一条消息回显。
+  app.post("/admin/api/platform/:platform/refresh", async (c) => {
+    const form = await c.req.parseBody();
+    await requireAdminWrite(c.req.raw, store, formString(form, "_csrf"));
+    const platform = c.req.param("platform");
+    if (platform !== "qq" && platform !== "netease") {
+      throw badRequest("平台无效");
+    }
+    const result = await refreshPlatformNow(store, platform);
+    await scheduleRefresh(result.nextAt);
+    return redirect("/admin?message=" + encodeURIComponent(result.message));
   });
 
   app.post("/admin/api/platform/:platform/logout", async (c) => {
