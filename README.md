@@ -95,6 +95,37 @@ wow-server 只接受 **https + 443 + 根路径** 的 Agent 地址，自定义域
 
 ---
 
+## 同步上游更新
+
+wow-server 会拿**上游仓库的最新提交号**和你部署的这份比：不一样就在用户中心每一页
+顶部挂一条黄色提醒，让你把上游同步进自己的仓库。
+
+Agent 在**构建时**把当前提交号盖进产物（`scripts/stamp-commit.mjs` →
+`src/generated/commit.ts`），运行时由 `/v1/status` 的 `agentCommit` 与 OAuth 授权页的
+`agent_commit` 上报。
+
+同步的做法：
+
+```bash
+git remote add upstream https://github.com/jrz233/wow-music-agent.git
+git fetch upstream
+git merge --ff-only upstream/main
+npx wrangler deploy
+```
+
+`git merge --ff-only` 会把你的 HEAD 推到上游最新的那个提交号上，两边相等，提醒消失。
+
+两个容易踩的坑：
+
+- **不要提交 `src/generated/`。** 它已经被 `.gitignore` 忽略：提交它会让你的仓库变脏，
+  `git pull` 会被 git 拦下来——正好破坏上面这套流程。盖章在 `npm install`、npm 的
+  `predeploy` 钩子和 `wrangler.toml` 的 `[build]` 里各做一次，所以
+  `npx wrangler deploy` 这种绕过 npm 的部署也会重新盖章。
+- **不要在镜像仓库里直接改代码。** 它是从 wow-server 的 `agent/` subtree split 出去的
+  发布镜像，下一次同步会覆盖掉。
+
+---
+
 ## 本地开发
 
 ```bash
@@ -123,7 +154,7 @@ npx wrangler deploy --dry-run --outdir dist
 
 | 路径 | 说明 |
 | --- | --- |
-| `/v1/status` | Agent 版本、能力列表与两个平台的登录状态 |
+| `/v1/status` | Agent 版本、源码提交号、能力列表与两个平台的登录状态 |
 | `/v1/library/playlists?platform=qq\|netease&limit=` | 用户歌单 |
 | `/v1/library/playlists/:id/tracks?platform=&limit=` | 歌单曲目 |
 | `/v1/library/favorites/tracks?platform=&limit=` | 收藏（「我喜欢的音乐」） |
@@ -163,6 +194,7 @@ npx wrangler deploy --dry-run --outdir dist
 src/
   index.ts          # Worker 入口：/healthz，其余转给 DO
   env.ts            # 常量（没有任何 secret）
+  commit.ts         # 构建时盖上的源码提交号（供 wow-server 判断版本新旧）
   agent/
     do.ts           # 单例 Durable Object、alarm、cron
     store.ts        # SQLite schema 与读写（密文列）

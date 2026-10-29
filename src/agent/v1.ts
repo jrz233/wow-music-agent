@@ -53,6 +53,7 @@ import { AgentError, badRequest, conflict, unavailable, unauthorized } from "../
 import { platformView } from "./refresh";
 import { redact } from "./redact";
 import { AGENT_API_VERSION, AGENT_VERSION } from "../env";
+import { AGENT_COMMIT } from "../commit";
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
@@ -83,6 +84,8 @@ export function createV1App(store: AgentStore, identity: AgentIdentity) {
     return signedJSON(c, identity, 200, {
       apiVersion: AGENT_API_VERSION,
       agentVersion: AGENT_VERSION,
+      // 源码提交号：服务端拿它和上游仓库的最新提交号比，判断要不要提醒用户同步。
+      agentCommit: AGENT_COMMIT,
       capabilities: CAPABILITIES,
       platforms: {
         qq: publicPlatform(platformView(store, "qq")),

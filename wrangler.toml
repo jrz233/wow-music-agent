@@ -10,6 +10,17 @@ workers_dev = true
 # 免费版 10ms CPU/请求对扫码轮询与 weapi 加密偏紧，建议 Workers Paid；免费版仍可运行，
 # 只是在冷启动时可能更慢。
 
+# 每次构建/部署前把当前源码的提交号写进 src/generated/commit.ts。
+#
+# 为什么放在这里而不是只放在 npm 钩子里：用户很可能直接敲 `npx wrangler deploy`，
+# 绕开 npm——那样提交号就是旧的，wow-server 会误以为「你部署的还是旧版」。
+# 这一行让任何姿势的部署都重新盖章。
+#
+# 写出来的文件被 .gitignore 忽略：它每次部署都会变，提交它会让用户的仓库变脏，
+# `git pull` 同步上游时会被 git 拦下来。
+[build]
+command = "node scripts/stamp-commit.mjs"
+
 [observability]
 enabled = true
 

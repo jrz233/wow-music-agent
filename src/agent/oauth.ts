@@ -18,6 +18,7 @@
 import type { AgentRecord, AgentStore } from "./store";
 import { OAUTH_PENDING_TTL_SECONDS } from "./store";
 import { AGENT_NAME, AGENT_VERSION } from "../env";
+import { AGENT_COMMIT } from "../commit";
 import {
   base64UrlDecode,
   base64UrlEncode,
@@ -168,6 +169,11 @@ export async function startOAuth(
   const url = new URL(`${serverUrl}${AUTHORIZE_PATH}`);
   url.searchParams.set("agent_name", agent);
   url.searchParams.set("agent_version", AGENT_VERSION);
+  // 源码提交号：服务端拿它和上游仓库的最新提交号比。拿不到就不带这个参数——
+  // 服务端会因此不提示更新，而不是误报。
+  if (AGENT_COMMIT) {
+    url.searchParams.set("agent_commit", AGENT_COMMIT);
+  }
   url.searchParams.set("endpoint", endpoint);
   url.searchParams.set("public_key", identity.publicKey);
   url.searchParams.set("redirect_uri", redirectUri);

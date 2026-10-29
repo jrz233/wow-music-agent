@@ -11,7 +11,12 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "stamp": "node scripts/stamp-commit.mjs",
+    "prepare": "node scripts/stamp-commit.mjs",
+    "predeploy": "node scripts/stamp-commit.mjs",
+    "pretypecheck": "node scripts/stamp-commit.mjs",
+    "pretest": "node scripts/stamp-commit.mjs"
   },
   "dependencies": {
     "hono": "^4.13.14",
