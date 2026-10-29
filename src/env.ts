@@ -11,7 +11,7 @@ export interface Env {
   AGENT: DurableObjectNamespace<AgentDurableObject>;
 }
 
-export const AGENT_VERSION = "0.1.0";
+export const AGENT_VERSION = "0.2.0";
 export const AGENT_NAME = "wow-music-agent";
 /** 与 wow-server `internal/features/agent` 的 `agentAPIVersion` 对齐。 */
 export const AGENT_API_VERSION = 1;
