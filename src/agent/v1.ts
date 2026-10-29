@@ -56,6 +56,8 @@ import { AGENT_API_VERSION, AGENT_VERSION } from "../env";
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
+/** 歌单曲目上限：与 wow-server `/v1` 的 trackLimit 上限一致，大歌单要能一次取全。 */
+const MAX_TRACK_LIMIT = 1000;
 const NONCE_RETENTION_SECONDS = 10 * 60;
 const MAX_REQUEST_BODY = 64 * 1024;
 /** 快照一次最多带多少张歌单的曲目：服务端按批补齐，避免一次调用打爆上游。 */
@@ -103,7 +105,8 @@ export function createV1App(store: AgentStore, identity: AgentIdentity) {
 
   app.get("/v1/library/playlists/:id/tracks", async (c) => {
     const platform = parsePlatform(c);
-    const limit = parseLimit(c);
+    // 曲目与列表分开限流：大歌单要能一次取到上千首。查询参数沿用 `limit` 以保持兼容。
+    const limit = parseTrackLimit(c, "limit");
     const id = (c.req.param("id") ?? "").trim();
     if (id === "" || id.length > 128) {
       throw badRequest("歌单 id 无效");
@@ -363,14 +366,17 @@ function parseLimit(c: Context): number {
   return Math.min(value, MAX_LIMIT);
 }
 
-/** 快照里的每张歌单取多少首；缺省 100，最多 200。 */
-function parseTrackLimit(c: Context): number {
-  const raw = c.req.query("trackLimit") ?? "";
+/**
+ * 歌单一侧取多少首。详情接口的参数名是 `limit`（与列表接口同名），快照接口
+ * 用的是 `trackLimit`，由调用方指定 key。缺省 100，最多 MAX_TRACK_LIMIT。
+ */
+function parseTrackLimit(c: Context, key = "trackLimit"): number {
+  const raw = c.req.query(key) ?? "";
   const value = Number.parseInt(raw, 10);
   if (!Number.isFinite(value) || value <= 0) {
     return DEFAULT_LIMIT;
   }
-  return Math.min(value, MAX_LIMIT);
+  return Math.min(value, MAX_TRACK_LIMIT);
 }
 
 /** 解析 `ids=a,b,c`。去重、截断到 SNAPSHOT_MAX_IDS，非法项直接跳过。 */

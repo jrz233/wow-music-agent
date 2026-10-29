@@ -12,6 +12,13 @@ import { QQClient } from "./client";
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
+/** 歌单详情单次最多返回的曲目数，与 `/v1` 协议的 trackLimit 上限一致。 */
+const MAX_TRACK_LIMIT = 1000;
+/** 翻页时的单页条数上限与并发：1000 首按 200 首一页就是 5 页。 */
+const TRACK_PAGE_SIZE = 200;
+const TRACK_PAGE_CONCURRENCY = 3;
+/** 翻页次数上限：上游若把单页压得很小（异常返回），不至于打出一串请求。 */
+const TRACK_MAX_PAGES = 10;
 
 /**
  * 用户歌单 = 自建 + 收藏。
@@ -44,21 +51,66 @@ export async function fetchPlaylists(client: QQClient, limit = DEFAULT_LIMIT): P
  * 对自建歌单与「我喜欢」都可用。`music.srfDissInfo.aiDissInfo/uniform_get_Dissinfo`
  * 作为兜底——新模块对部分歌单（例如每日推荐）更宽，但对旧客户端身份会回 10006。
  * 两个响应结构一致（`dirinfo` + `songlist`），映射只写一份。
+ *
+ * 首批按上游稳定的单页上限（200）取；短于平台自报的曲目总数时再按
+ * `song_begin` 翻页，步长取首批实际拿到的条数，并发 `TRACK_PAGE_CONCURRENCY`。
  */
 export async function fetchPlaylistDetail(
   client: QQClient,
   id: string,
   limit = DEFAULT_LIMIT,
 ): Promise<AgentPlaylistDetail> {
-  const num = clampLimit(limit);
+  const num = clampTrackLimit(limit);
+  const firstSize = Math.min(num, TRACK_PAGE_SIZE);
+  const first = await requestDiss(client, id, 0, firstSize);
+  const info = asRecord(first.dirinfo) ?? asRecord(first.info) ?? first;
+  const tracks = detailTracks(first).slice(0, firstSize);
+  const seen = new Set(tracks.map((track) => track.id));
+  const trackCount = mapPlaylist(info).trackCount;
+  // 平台自报的曲目总数决定还要翻几页：总数缺失时按首批条数收住，不去猜。
+  const total = Math.min(num, trackCount || tracks.length);
+  if (tracks.length > 0 && tracks.length < total) {
+    // 首批实际条数就是上游肯给的单页上限；从首批末尾接着切剩下的区间。
+    const step = Math.min(tracks.length, TRACK_PAGE_SIZE);
+    const offsets: number[] = [];
+    for (let begin = tracks.length; begin < total && offsets.length < TRACK_MAX_PAGES; begin += step) {
+      offsets.push(begin);
+    }
+    const pages = await mapLimit(offsets, TRACK_PAGE_CONCURRENCY, (begin) =>
+      requestDiss(client, id, begin, Math.min(step, total - begin)).then(detailTracks),
+    );
+    for (const page of pages) {
+      for (const track of page) {
+        // 翻页期间歌单可能被改过：重复 id 只留第一次出现的位置。
+        if (track.id === "" || seen.has(track.id)) {
+          continue;
+        }
+        seen.add(track.id);
+        tracks.push(track);
+      }
+    }
+  }
+  return {
+    ...mapPlaylist(info),
+    id: text(info.dissid) || text(info.id) || text(info.dirId) || id,
+    tracks: tracks.slice(0, num),
+  };
+}
+
+/** 调一次歌单详情模块；两个模块的响应结构一致。 */
+async function requestDiss(
+  client: QQClient,
+  id: string,
+  begin: number,
+  num: number,
+): Promise<Record<string, unknown>> {
   const numericID = Number(id);
   const page = {
-    song_begin: 0,
+    song_begin: begin,
     song_num: num,
   };
-  let data: Record<string, unknown>;
   try {
-    data = await client.call("music.srfDissInfo.DissInfo", "CgiGetDiss", {
+    return await client.call("music.srfDissInfo.DissInfo", "CgiGetDiss", {
       disstid: Number.isFinite(numericID) && numericID > 0 ? numericID : id,
       dirid: 0,
       tag: 1,
@@ -68,7 +120,7 @@ export async function fetchPlaylistDetail(
       ...page,
     });
   } catch {
-    data = await client.call("music.srfDissInfo.aiDissInfo", "uniform_get_Dissinfo", {
+    return await client.call("music.srfDissInfo.aiDissInfo", "uniform_get_Dissinfo", {
       disstid: id,
       userinfo: 1,
       tag: 1,
@@ -78,15 +130,35 @@ export async function fetchPlaylistDetail(
       ...page,
     });
   }
-  const info = asRecord(data.dirinfo) ?? asRecord(data.info) ?? data;
-  const tracks = firstArray(data, ["songlist", "songs", "list"])
+}
+
+/** 把一页详情映射成 AgentTrack[]。 */
+function detailTracks(data: Record<string, unknown>): AgentTrack[] {
+  return extractTracks(data)
     .map(mapTrack)
-    .filter((item) => item.id !== "");
-  return {
-    ...mapPlaylist(info),
-    id: text(info.dissid) || text(info.id) || text(info.dirId) || id,
-    tracks: tracks.slice(0, num),
-  };
+    .filter((track) => track.id !== "");
+}
+
+/** 并发受限的 map：保持结果顺序，最多 limit 个同时在飞。 */
+async function mapLimit<T, R>(items: T[], limit: number, run: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) {
+        return;
+      }
+      const item = items[index];
+      if (item === undefined) {
+        continue;
+      }
+      results[index] = await run(item);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -403,6 +475,14 @@ export function clampLimit(value: number | undefined): number {
     return DEFAULT_LIMIT;
   }
   return Math.min(Math.floor(value as number), MAX_LIMIT);
+}
+
+/** 歌单曲目上限：与列表分开，最多 MAX_TRACK_LIMIT（大歌单要能一次取全）。 */
+export function clampTrackLimit(value: number | undefined): number {
+  if (!Number.isFinite(value) || (value ?? 0) <= 0) {
+    return DEFAULT_LIMIT;
+  }
+  return Math.min(Math.floor(value as number), MAX_TRACK_LIMIT);
 }
 
 function firstArray(data: Record<string, unknown>, keys: string[]): unknown[] {

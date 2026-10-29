@@ -131,7 +131,8 @@ npx wrangler deploy --dry-run --outdir dist
 | `/v1/recommend/daily?platform=&limit=` | 每日推荐 |
 | `/v1/recommend/roam?platform=&mode=radar\|radio&limit=` | 漫游；`mode` 仅 QQ 有效 |
 
-统一响应 `{items, hasMore, nextOffset}`，歌单详情为 `{playlist}`。`limit` 上限 200。
+统一响应 `{items, hasMore, nextOffset}`，歌单详情为 `{playlist}`。列表类 `limit` 上限 200；
+歌单详情的 `limit` 按曲目计，上限 1000，超过一页时 Agent 自行翻页取全。
 快照接口返回 `{platforms:{qq:{playlists,favorites,details,error}, netease:{...}}}`，
 `ids` 最多 20 个，用于只补齐指定歌单的详情。
 **不会返回**：平台 Cookie / token、播放地址、歌词、平台隐私字段或任意 URL。

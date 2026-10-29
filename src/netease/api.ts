@@ -13,6 +13,11 @@ import { NeteaseClient } from "./client";
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 200;
+/** 歌单详情单次最多返回的曲目数，与 `/v1` 协议的 trackLimit 上限一致。 */
+const MAX_TRACK_LIMIT = 1000;
+/** 曲目详情接口一次最多 200 个 id；并发取回，1000 首一轮就能发完。 */
+const SONG_DETAIL_BATCH = 200;
+const SONG_DETAIL_CONCURRENCY = 5;
 /** Personal FM 一次只给几首，靠连问几轮凑队列。 */
 const FM_ROUNDS = 3;
 
@@ -33,22 +38,28 @@ export async function fetchPlaylistDetail(
   id: string,
   limit = DEFAULT_LIMIT,
 ): Promise<AgentPlaylistDetail> {
+  const max = clampTrackLimit(limit);
   const data = await client.call("v6/playlist/detail", { id, n: 1000, s: 8 });
   const playlist = record(data.playlist);
   if (!playlist) {
     throw new Error("playlist missing");
   }
-  const tracks = array(playlist.tracks).map(mapTrack);
-  let resolved = tracks;
-  if (resolved.length === 0) {
-    const ids = array(playlist.trackIds).map((item) => record(item)?.id).filter(Boolean) as (string | number)[];
-    if (ids.length > 0) {
-      resolved = await fetchSongs(client, ids.map(String));
+  const ids = array(playlist.trackIds)
+    .map((item) => text(record(item)?.id))
+    .filter((item) => item !== "")
+    .slice(0, max);
+  let resolved = array(playlist.tracks).map(mapTrack);
+  // 大歌单的 `tracks` 常常只带一部分（甚至为空），完整顺序在 `trackIds` 里：
+  // 缺的部分按 id 补取，最多补到请求条数。
+  if (ids.length > resolved.length && resolved.length < max) {
+    const missing = ids.slice(resolved.length, max);
+    if (missing.length > 0) {
+      resolved = resolved.concat(await fetchSongs(client, missing));
     }
   }
   return {
     ...mapPlaylist(playlist),
-    tracks: resolved.slice(0, clampLimit(limit)),
+    tracks: resolved.slice(0, max),
   };
 }
 
@@ -114,15 +125,38 @@ async function likedPlaylistID(client: NeteaseClient): Promise<string> {
 }
 
 async function fetchSongs(client: NeteaseClient, ids: string[]): Promise<AgentTrack[]> {
-  const result: AgentTrack[] = [];
-  for (let index = 0; index < ids.length; index += 200) {
-    const chunk = ids.slice(index, index + 200);
-    const data = await client.call("v3/song/detail", {
-      c: JSON.stringify(chunk.map((id) => ({ id }))),
-    });
-    result.push(...array(data.songs).map(mapTrack));
+  const chunks: string[][] = [];
+  for (let index = 0; index < ids.length; index += SONG_DETAIL_BATCH) {
+    chunks.push(ids.slice(index, index + SONG_DETAIL_BATCH));
   }
-  return result;
+  const pages = await mapLimit(chunks, SONG_DETAIL_CONCURRENCY, (chunk) =>
+    client
+      .call("v3/song/detail", { c: JSON.stringify(chunk.map((id) => ({ id }))) })
+      .then((data) => array(data.songs).map(mapTrack)),
+  );
+  return pages.flat();
+}
+
+/** 并发受限的 map：保持结果顺序，最多 limit 个同时在飞。 */
+async function mapLimit<T, R>(items: T[], limit: number, run: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) {
+        return;
+      }
+      const item = items[index];
+      if (item === undefined) {
+        continue;
+      }
+      results[index] = await run(item);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 export function mapPlaylist(raw: unknown): AgentPlaylist {
@@ -171,6 +205,14 @@ export function clampLimit(value: number | undefined): number {
     return DEFAULT_LIMIT;
   }
   return Math.min(Math.floor(value as number), MAX_LIMIT);
+}
+
+/** 歌单曲目上限：与列表分开，最多 MAX_TRACK_LIMIT。 */
+export function clampTrackLimit(value: number | undefined): number {
+  if (!Number.isFinite(value) || (value ?? 0) <= 0) {
+    return DEFAULT_LIMIT;
+  }
+  return Math.min(Math.floor(value as number), MAX_TRACK_LIMIT);
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
