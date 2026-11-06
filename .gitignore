@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+*.log
+.DS_Store
+
+# 构建时盖章的源码提交号：每次部署都会重写，提交它会让仓库变脏，
+# `git pull` 同步上游时会被 git 拦下来。
+src/generated/

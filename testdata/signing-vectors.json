@@ -1,0 +1,31 @@
+{
+  "pair": {
+    "body": "",
+    "canonical": "WOW-PAIR-V1\nGET\n/agent/v1/pair/status\n\n1700000000\nffeeddccbbaa99887766554433221100\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "method": "GET",
+    "nonce": "ffeeddccbbaa99887766554433221100",
+    "path": "/agent/v1/pair/status",
+    "query": "",
+    "signature": "ApwCPOZc8qn0HHa3G2K0awNNr33wygAkEdNbhwRpCF5gmxmhkeaV5wCz9y5bVwo34w8b3a0ZA9Ca9i8HBYHgDg",
+    "timestamp": "1700000000"
+  },
+  "publicKey": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+  "request": {
+    "body": "",
+    "canonical": "WOW-AGENT-REQUEST-V1\nGET\n/v1/library/playlists\nlimit=100\u0026platform=qq\n1700000000\n00112233445566778899aabbccddeeff\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "method": "GET",
+    "nonce": "00112233445566778899aabbccddeeff",
+    "path": "/v1/library/playlists",
+    "query": "limit=100\u0026platform=qq",
+    "signature": "IDMoJADyqw9oSlRcDT1ZQThmz1TFhSI3XsrmS2ZR7PXrXN-M5BXHMpoQiYwRKyKv5vgyO6BZnwaxUWyFP8LeBg",
+    "timestamp": "1700000000"
+  },
+  "response": {
+    "body": "{\"items\":[],\"hasMore\":false,\"nextOffset\":0}",
+    "canonical": "WOW-AGENT-RESPONSE-V1\n200\nf0cbb263b2627e47452404f23554400e711f17aab0b40189f2ed504236485e89\n00112233445566778899aabbccddeeff",
+    "requestNonce": "00112233445566778899aabbccddeeff",
+    "signature": "dWhXqUY3f8_MmbJjPZugq4H_Mksw5abqdLEqqazENtDNvvQmvEqG3KGZsKjaiv77TnmUpq8PVKlhMCo0q-yDBA",
+    "status": 200
+  },
+  "seed": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+}

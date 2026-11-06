@@ -1,0 +1,33 @@
+{
+  "name": "wow-music-agent",
+  "version": "0.2.0",
+  "private": true,
+  "description": "自托管的 QQ 音乐 / 网易云音乐账号 Agent，运行在 Cloudflare Workers 上",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "cf-typegen": "wrangler types",
+    "stamp": "node scripts/stamp-commit.mjs",
+    "prepare": "node scripts/stamp-commit.mjs",
+    "predeploy": "node scripts/stamp-commit.mjs",
+    "pretypecheck": "node scripts/stamp-commit.mjs",
+    "pretest": "node scripts/stamp-commit.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.13.14",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261027.1",
+    "@types/node": "^26.6.5",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7",
+    "wrangler": "^4.153.0"
+  }
+}
