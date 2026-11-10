@@ -31,8 +31,13 @@ export type QQLoginPoll =
   | { state: "expired"; cookie: string }
   | { state: "success"; credentials: PlatformCredentials };
 
-/** musickey 的公开有效期约 90 天；这里按到期前滚动探活、30 天续一次。 */
-const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+/**
+ * 上游没给 `musickeyCreateTime + keyExpiresIn` 时的兜底有效期。
+ *
+ * 正常情况下到期时间由上游字段精确计算（见 `credentialExpiry`）；兜底只用于
+ * 旧凭据或接口字段缺失，取一天，让下一轮探活能尽快补上真实值。
+ */
+const FALLBACK_TTL_SECONDS = 24 * 60 * 60;
 
 export async function beginQQLogin(): Promise<QQLoginStart> {
   const qr = await new QQClient().createMobileQR();
@@ -75,7 +80,8 @@ function loginPoll(result: QQLoginState, cookie: string): QQLoginPoll {
         nickname: result.result.account.nickname,
         avatarUrl: result.result.account.avatarUrl,
         credential: result.result.credential,
-        expiresAt: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+        expiresAt:
+          result.result.expiresAt || Math.floor(Date.now() / 1000) + FALLBACK_TTL_SECONDS,
       },
     };
   }
@@ -102,6 +108,6 @@ export async function refreshQQ(cookie: string): Promise<PlatformCredentials | n
     nickname: result.nickname || "",
     avatarUrl: result.avatarUrl || "",
     credential: result.credential,
-    expiresAt: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+    expiresAt: result.expiresAt || Math.floor(Date.now() / 1000) + FALLBACK_TTL_SECONDS,
   };
 }

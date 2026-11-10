@@ -10,7 +10,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { QQClient } from "../src/qq/client";
+import { QQClient, credentialExpiry } from "../src/qq/client";
 import { MobileQRSocket, parsePacket } from "../src/qq/mqtt";
 
 interface Seen {
@@ -252,6 +252,55 @@ describe("QQ 音乐 App 扫码", () => {
     // 凭据要能把这套设备身份带回来，续期才不会换设备。
     expect(qr.cookie).toMatch(/open_udid2=[0-9a-f]{32}/u);
     expect(qr.cookie).toMatch(/imei=\d{15}/u);
+    // QIMEI 与匿名会话也必须持久化：冷启动后重新申请会被上游当成新设备。
+    expect(qr.cookie).toContain("qimei36=QIMEI36");
+    expect(qr.cookie).toContain("session_uid=SESSION_UID");
+    expect(qr.cookie).toContain("session_sid=SESSION_SID");
+  });
+
+  it("冷启动续期：从凭据恢复 QIMEI 与匿名会话，换票用同一台设备", async () => {
+    const payload = JSON.stringify({
+      cookies: { qqmusic_uin: { value: "456" }, qqmusic_key: { value: "APP_KEY" } },
+    });
+    stubQQSocket({ type: "cookies", payload });
+    const seen = stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: { code: 0, data: { musicid: 456, musickey: "APP_KEY", loginType: 6 } },
+          }),
+        },
+      },
+    ]);
+    // 模拟 Durable Object 冷启动后只剩加密凭据里的 Cookie。
+    const client = new QQClient(
+      [
+        "android_id=0011223344556677",
+        "open_udid=00112233445566778899aabbccddeeff",
+        "open_udid2=ffeeddccbbaa99887766554433221100",
+        "imei=123456789012345",
+        "qimei16=QIMEI16",
+        "qimei36=QIMEI36",
+        "session_uid=RESTORED_UID",
+        "session_sid=RESTORED_SID",
+      ].join("; "),
+    );
+
+    const state = await client.checkMobileQR("QR_ID", 2_000);
+    expect(state.state).toBe("success");
+
+    const login = seen.find((item) => item.body.includes("music.login.LoginServer"));
+    const request = JSON.parse(login?.body ?? "{}");
+    expect(request.comm.QIMEI36).toBe("QIMEI36");
+    expect(request.comm.uid).toBe("RESTORED_UID");
+    expect(request.comm.sid).toBe("RESTORED_SID");
+    if (state.state === "success") {
+      expect(state.result.credential).toContain("qimei36=QIMEI36");
+      expect(state.result.credential).toContain("session_uid=RESTORED_UID");
+      expect(state.result.credential).toContain("session_sid=RESTORED_SID");
+    }
   });
 
   it("App 扫码状态由 MQTT 推送：scanned / canceled / timeout 映射成已扫 / 过期", async () => {
@@ -456,6 +505,195 @@ describe("MQTT 协议细节", () => {
 
     const ack = sockets[0]?.sent.find((bytes) => (bytes[0] ?? 0) === 0x40);
     expect(ack).toEqual(new Uint8Array([0x40, 0x02, 0x00, 0x07]));
+  });
+});
+
+describe("QQ 续期", () => {
+  const now = Math.floor(Date.now() / 1000);
+
+  function cred(...extra: string[]): string {
+    return [
+      "uin=456",
+      "qm_keyst=OLD_KEY",
+      "musicid=456",
+      "loginType=6",
+      "android_id=0011223344556677",
+      "open_udid=00112233445566778899aabbccddeeff",
+      "open_udid2=ffeeddccbbaa99887766554433221100",
+      "imei=123456789012345",
+      ...extra,
+    ].join("; ");
+  }
+
+  it("到期时间取 musickeyCreateTime + keyExpiresIn，缺失时为 0", () => {
+    expect(credentialExpiry(cred(`musickeyCreateTime=${now}`, `keyExpiresIn=3600`))).toBe(
+      now + 3600,
+    );
+    // 毫秒时间戳也兼容。
+    expect(credentialExpiry(cred(`musickeyCreateTime=${now * 1000}`, "keyExpiresIn=60"))).toBe(
+      now + 60,
+    );
+    expect(credentialExpiry(cred())).toBe(0);
+    expect(credentialExpiry(cred(`musickeyCreateTime=${now}`))).toBe(0);
+  });
+
+  it("离到期还远时只探活，不消耗 refresh_token", async () => {
+    const seen = stubFetch([
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: JSON.stringify({ code: 0, data: { creator: { nick: "远未到期" } } }) },
+      },
+    ]);
+    const client = new QQClient(
+      cred(
+        `musickeyCreateTime=${now}`,
+        "keyExpiresIn=86400",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+      ),
+    );
+
+    const result = await client.refresh();
+
+    expect(result?.nickname).toBe("远未到期");
+    // 30 分钟一次的定时任务不能每次都调续期接口。
+    expect(seen.filter((item) => item.body.includes("music.login.LoginServer"))).toHaveLength(0);
+    expect(result?.credential).toContain("refresh_token=OLD_REFRESH");
+    expect(result?.credential).toContain("refresh_key=OLD_REFRESH_KEY");
+    expect(result?.expiresAt).toBe(now + 86400);
+  });
+
+  it("临近到期才续期；响应没回 refresh 材料时沿用旧值", async () => {
+    const seen = stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: {
+              code: 0,
+              data: {
+                str_musicid: "456",
+                musickey: "NEW_KEY",
+                loginType: 6,
+                keyExpiresIn: 7200,
+                nick: "续期成功",
+              },
+            },
+          }),
+        },
+      },
+    ]);
+    const client = new QQClient(
+      cred(
+        `musickeyCreateTime=${now - 86400}`,
+        "keyExpiresIn=3600",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+        "openid=OLD_OPENID",
+      ),
+    );
+
+    const result = await client.refresh();
+
+    const login = seen.find((item) => item.body.includes("music.login.LoginServer"));
+    expect(login).toBeTruthy();
+    expect(JSON.parse(login?.body ?? "{}").req_0.param.refresh_token).toBe("OLD_REFRESH");
+    expect(result?.nickname).toBe("续期成功");
+    expect(result?.credential).toContain("qm_keyst=NEW_KEY");
+    // 续期响应只回了新 key：旧 refresh 材料必须保留，否则下一轮再也续不了。
+    expect(result?.credential).toContain("refresh_token=OLD_REFRESH");
+    expect(result?.credential).toContain("refresh_key=OLD_REFRESH_KEY");
+    expect(result?.credential).toContain("openid=OLD_OPENID");
+    // 有效期从这次响应算起。
+    expect(result?.expiresAt).toBeGreaterThan(now + 7000);
+    expect(result?.expiresAt).toBeLessThanOrEqual(now + 7300);
+  });
+
+  it("19 位微信 musicid 续期：响应回数字也不丢精度", async () => {
+    const uin = "1152921504606846976";
+    stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: {
+          // 直接写原始数字字面量，模拟上游返回 JSON number。
+          body: `{"code":0,"req_0":{"code":0,"data":{"musicid":${uin},"musickey":"NEW_KEY","loginType":1,"keyExpiresIn":3600}}}`,
+        },
+      },
+    ]);
+    const client = new QQClient(
+      [
+        `uin=${uin}`,
+        "qm_keyst=OLD_KEY",
+        `musicid=${uin}`,
+        "loginType=1",
+        "android_id=0011223344556677",
+        "open_udid=00112233445566778899aabbccddeeff",
+        "open_udid2=ffeeddccbbaa99887766554433221100",
+        "imei=123456789012345",
+        `musickeyCreateTime=${now - 86400}`,
+        "keyExpiresIn=60",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+      ].join("; "),
+    );
+
+    const result = await client.refresh();
+
+    expect(result?.credential).toContain(`uin=${uin}`);
+    expect(result?.credential).not.toContain("uin=1152921504606847000");
+  });
+
+  it("续期被拒但旧凭据仍可用：保留旧 key，退避后重试而不是判掉线", async () => {
+    stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: { body: JSON.stringify({ code: 0, req_0: { code: 20279, data: {} } }) },
+      },
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: JSON.stringify({ code: 0, data: { creator: { nick: "旧凭据仍有效" } } }) },
+      },
+    ]);
+    const client = new QQClient(
+      cred(
+        `musickeyCreateTime=${now - 86400}`,
+        "keyExpiresIn=3600",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+      ),
+    );
+
+    const result = await client.refresh();
+
+    expect(result?.nickname).toBe("旧凭据仍有效");
+    expect(result?.credential).toContain("qm_keyst=OLD_KEY");
+    expect(result?.credential).toContain("refresh_token=OLD_REFRESH");
+    const retryAt = Number(result?.credential.match(/refresh_after=(\d+)/u)?.[1] ?? 0);
+    // 已过本地到期时间，但资料接口还能读：按 30 分钟退避重试。
+    expect(retryAt).toBeGreaterThan(now);
+    expect(retryAt).toBeLessThanOrEqual(now + 31 * 60);
+  });
+
+  it("续期遇到网络错误要向上抛，不能误判成已掉线", async () => {
+    stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: () => {
+          throw new Error("network down");
+        },
+      },
+    ]);
+    const client = new QQClient(
+      cred(
+        `musickeyCreateTime=${now - 86400}`,
+        "keyExpiresIn=60",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+      ),
+    );
+
+    await expect(client.refresh()).rejects.toThrow("network down");
   });
 });
 

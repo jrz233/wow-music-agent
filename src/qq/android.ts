@@ -11,8 +11,8 @@
  *   2. 由设备身份申请 QIMEI36（AES + RSA + MD5 的公开协议，结果缓存一天）；
  *   3. 用同一设备身份申请匿名 Android 会话（uid/sid，按自然日复用）。
  *
- * 凭据里会带着设备身份，续期时复用同一套；QIMEI 与会话只在内存里缓存，
- * Durable Object 冷启动后重新申请即可。
+ * 凭据里会带着完整的设备身份（含 QIMEI 与匿名会话），续期时原样复用；
+ * 只在内存里缓存会让每次冷启动都像换了一台设备，容易触发风控 / 设备数上限。
  */
 
 import {
@@ -57,10 +57,22 @@ export interface AndroidSession {
   savedAt: number;
 }
 
-interface Qimei {
+export interface Qimei {
   q16: string;
   q36: string;
   savedAt: number;
+}
+
+/**
+ * 设备身份里**不能重新生成**的部分。
+ *
+ * QIMEI 与匿名会话都跟设备绑定：每次冷启动都重新申请，上游会把它当成一台新
+ * 设备，续期时轻则风控、重则 20279（设备数超限）。所以它们要跟凭据一起存，
+ * 冷启动后原样恢复；同一天内的匿名会话也直接复用（跨天再续）。
+ */
+export interface AndroidIdentity {
+  qimei: Qimei | null;
+  session: AndroidSession | null;
 }
 
 /** 换票参数里的 `musicid` 要原样写成 JSON 数字（微信账号有 19 位）。 */
@@ -105,6 +117,55 @@ export function deviceCookie(device: QQDevice): string {
   ].join("; ");
 }
 
+/** 把 QIMEI / 匿名会话写进 Cookie 串，随凭据一起持久化。 */
+export function identityCookie(identity: AndroidIdentity): string {
+  const parts: string[] = [];
+  if (identity.qimei) {
+    parts.push(
+      `qimei16=${identity.qimei.q16}`,
+      `qimei36=${identity.qimei.q36}`,
+      `qimei_saved_at=${identity.qimei.savedAt}`,
+    );
+  }
+  if (identity.session) {
+    parts.push(
+      `session_uid=${identity.session.uid}`,
+      `session_sid=${identity.session.sid}`,
+      `session_saved_at=${identity.session.savedAt}`,
+    );
+  }
+  return parts.join("; ");
+}
+
+/** 从凭据 Cookie 里恢复设备身份；缺字段时返回 null，让它照常重新申请。 */
+export function identityFrom(cookie: string): AndroidIdentity {
+  const q16 = cookieValue(cookie, "qimei16");
+  const q36 = cookieValue(cookie, "qimei36");
+  const qimeiSavedAt = Number(cookieValue(cookie, "qimei_saved_at"));
+  const uid = cookieValue(cookie, "session_uid");
+  const sid = cookieValue(cookie, "session_sid");
+  const sessionSavedAt = Number(cookieValue(cookie, "session_saved_at"));
+  return {
+    qimei:
+      q16 && q36
+        ? {
+            q16,
+            q36,
+            savedAt: Number.isFinite(qimeiSavedAt) && qimeiSavedAt > 0 ? qimeiSavedAt : Date.now(),
+          }
+        : null,
+    session:
+      uid && sid
+        ? {
+            uid,
+            sid,
+            savedAt:
+              Number.isFinite(sessionSavedAt) && sessionSavedAt > 0 ? sessionSavedAt : Date.now(),
+          }
+        : null,
+  };
+}
+
 /** 续期必须复用登录时的设备身份；缺失时现生成一个（仅影响风控，不影响正确性）。 */
 export function deviceFrom(cookie: string): QQDevice {
   const androidId = cookieValue(cookie, "android_id");
@@ -139,7 +200,28 @@ export class AndroidContext {
   private session: AndroidSession | null = null;
   private sessionPending: Promise<AndroidSession | null> | null = null;
 
-  constructor(readonly device: QQDevice) {}
+  constructor(
+    readonly device: QQDevice,
+    identity: AndroidIdentity = { qimei: null, session: null },
+  ) {
+    this.qimei = identity.qimei;
+    this.session = identity.session;
+  }
+
+  /** 当前身份快照；写进凭据，冷启动后原样恢复。 */
+  snapshot(): AndroidIdentity {
+    return { qimei: this.qimei, session: this.session };
+  }
+
+  /** 内存里已有更新值时不要被旧快照覆盖。 */
+  adopt(identity: AndroidIdentity): void {
+    if (this.qimei === null && identity.qimei !== null) {
+      this.qimei = identity.qimei;
+    }
+    if (this.session === null && identity.session !== null) {
+      this.session = identity.session;
+    }
+  }
 
   /**
    * 调一个登录族 CGI。
@@ -296,13 +378,18 @@ export class AndroidContext {
  */
 const contexts = new Map<string, AndroidContext>();
 
-export function contextFor(device: QQDevice): AndroidContext {
+export function contextFor(
+  device: QQDevice,
+  identity: AndroidIdentity = { qimei: null, session: null },
+): AndroidContext {
   const key = `${device.androidId}:${device.openUdid}`;
   const existing = contexts.get(key);
   if (existing) {
+    // 冷启动后凭据里恢复出来的设备身份也要补进已有上下文（只补缺，不覆盖新值）。
+    existing.adopt(identity);
     return existing;
   }
-  const context = new AndroidContext(device);
+  const context = new AndroidContext(device, identity);
   contexts.set(key, context);
   if (contexts.size > 8) {
     const oldest = contexts.keys().next().value;
