@@ -88,12 +88,19 @@ function loginPoll(result: QQLoginState, cookie: string): QQLoginPoll {
   return { state: result.state, cookie };
 }
 
-/** 探活 / 续期。凭据失效返回 null；网络错误向上抛（标记 degraded）。 */
-export async function refreshQQ(cookie: string): Promise<PlatformCredentials | null> {
+/**
+ * 探活 / 续期。凭据失效返回 null；网络错误向上抛（标记 degraded）。
+ *
+ * `needProfile` 让探活顺手补回昵称 / 头像（旧凭据可能只存了 musicid）。
+ */
+export async function refreshQQ(
+  cookie: string,
+  needProfile = false,
+): Promise<PlatformCredentials | null> {
   const client = new QQClient(cookie);
   let result;
   try {
-    result = await client.refresh();
+    result = await client.refresh(needProfile);
   } catch (error) {
     if (error instanceof PlatformNetworkError) {
       throw error;

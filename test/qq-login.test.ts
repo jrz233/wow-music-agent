@@ -415,6 +415,54 @@ describe("QQ 音乐 App 扫码", () => {
     expect(sockets).toHaveLength(1);
   });
 
+  it("微信账号换票没有 nick：登录后读用户资料补昵称与头像", async () => {
+    const payload = JSON.stringify({
+      cookies: { qqmusic_uin: { value: "456" }, qqmusic_key: { value: "W_X_APP_KEY" } },
+    });
+    stubQQSocket({ type: "cookies", payload });
+    const seen = stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            // 微信账号的换票响应通常只有 loginType=1 与 musickey，没有 nick。
+            code: 0,
+            req_0: { code: 0, data: { musicid: 456, musickey: "W_X_APP_KEY", loginType: 1 } },
+          }),
+        },
+      },
+      {
+        match: "get_user_baseinfo_v2",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: {
+              code: 0,
+              data: {
+                map_userinfo: {
+                  "456": { nick: "微信昵称", headurl: "http://thirdwx.qlogo.cn/avatar" },
+                },
+              },
+            },
+          }),
+        },
+      },
+    ]);
+
+    const client = new QQClient(
+      "android_id=0011223344556677; open_udid=00112233445566778899aabbccddeeff",
+    );
+    const state = await client.checkMobileQR("QR_ID", 2_000);
+    expect(state.state).toBe("success");
+    if (state.state !== "success") return;
+
+    // 不能用 musicid 兜底成 ID，头像也不能用 QQ 的 qlogo.cn 地址。
+    expect(state.result.account.nickname).toBe("微信昵称");
+    expect(state.result.account.avatarUrl).toBe("https://thirdwx.qlogo.cn/avatar");
+    const info = seen.find((item) => item.body.includes("get_user_baseinfo_v2"));
+    expect(JSON.parse(info?.body ?? "{}").req_0.param.vec_uin).toEqual(["456"]);
+  });
+
   it("19 位微信 musicid 原样写进 Login：先转 Number 会丢精度", async () => {
     const uin = "1152921504606846976";
     const payload = JSON.stringify({
@@ -608,6 +656,39 @@ describe("QQ 续期", () => {
     // 有效期从这次响应算起。
     expect(result?.expiresAt).toBeGreaterThan(now + 7000);
     expect(result?.expiresAt).toBeLessThanOrEqual(now + 7300);
+  });
+
+  it("旧账号昵称是 ID 时，探活顺手把昵称和头像补回来", async () => {
+    stubFetch([
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: JSON.stringify({ code: 0, data: { creator: { nick: "资料页昵称" } } }) },
+      },
+      {
+        match: "get_user_baseinfo_v2",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: {
+              code: 0,
+              data: {
+                map_userinfo: {
+                  "456": { nick: "真实昵称", headurl: "http://thirdwx.qlogo.cn/me" },
+                },
+              },
+            },
+          }),
+        },
+      },
+    ]);
+    const client = new QQClient(
+      cred(`musickeyCreateTime=${now}`, "keyExpiresIn=86400"),
+    );
+
+    const result = await client.refresh(true);
+
+    expect(result?.nickname).toBe("真实昵称");
+    expect(result?.avatarUrl).toBe("https://thirdwx.qlogo.cn/me");
   });
 
   it("19 位微信 musicid 续期：响应回数字也不丢精度", async () => {

@@ -169,9 +169,12 @@ async function refreshOne(
 
   let refreshed: PlatformCredentials | null;
   try {
+    // 旧 QQ 凭据可能把昵称存成了 musicid（微信账号尤其常见），且头像也缺；
+    // 探活时顺手补一次，不必等用户重新扫码。
+    const needProfile = row.nickname === "" || row.nickname === row.accountId;
     refreshed =
       platform === "qq"
-        ? await refreshQQ(credentials.credential)
+        ? await refreshQQ(credentials.credential, needProfile)
         : await refreshNetease(credentials.credential);
   } catch (error) {
     store.markPlatform(platform, now, {

@@ -227,7 +227,7 @@ export class QQClient {
           });
           throw unavailable(`QQ 音乐扫码登录失败 (${code})`);
         }
-        const result = this.loginSuccess(data, device, 6, cookies);
+        const result = await this.loginSuccess(data, device, 6, cookies);
         socket.loginSucceeded();
         return result;
       } catch (error) {
@@ -243,12 +243,12 @@ export class QQClient {
   }
 
   /** 把一次成功的换票响应整理成 `QQLoginState`。 */
-  private loginSuccess(
+  private async loginSuccess(
     data: Record<string, unknown>,
     device: QQDevice,
     fallbackLoginType: number,
     cookieLines: string[],
-  ): QQLoginState {
+  ): Promise<QQLoginState> {
     const loginType = loginTypeOf(data, fallbackLoginType);
     const credential = credentialCookies(
       data,
@@ -259,14 +259,19 @@ export class QQClient {
       contextFor(device).snapshot(),
     );
     const musicid = cookieValue(credential, "uin");
+    // 换票响应里的 nick 对微信账号经常为空；用换回来的凭据再读一次资料，
+    // 昵称和头像都以平台侧的真实值优先。
+    this.cookie = credential;
+    const info = await this.accountInfo();
     return {
       state: "success",
       result: {
         credential,
         account: {
           userId: musicid,
-          nickname: text(data.nick) || musicid,
-          avatarUrl: avatarFor(musicid),
+          nickname: info?.nickname || text(data.nick) || musicid,
+          // 微信账号没有可用的 QQ 头像，宁可不填也不要给一个 404 地址。
+          avatarUrl: info?.avatarUrl || (loginType === 1 ? "" : avatarFor(musicid)),
         },
         expiresAt: credentialExpiry(credential),
       },
@@ -280,10 +285,13 @@ export class QQClient {
    * 只有凭据临近真实到期（或拿不到有效期）时，才消耗一次 refresh_token。
    * 其余时候只读一次资料接口确认登录态，避免把续期额度耗在无意义的轮换上。
    *
+   * `needProfile` 用于修复旧账号「昵称显示成 ID / 没有头像」：探活时顺手读一次
+   * 用户资料，把展示信息补回来。
+   *
    * 返回 null 表示凭据已失效（需要重新扫码）；网络错误向上抛（上层标记
    * degraded 稍后重试），不会被误当成「已掉线」。
    */
-  async refresh(): Promise<QQRefreshResult | null> {
+  async refresh(needProfile = false): Promise<QQRefreshResult | null> {
     const musicid = this.uin;
     const musickey = this.musickey;
     if (!musicid || !musickey) {
@@ -366,6 +374,9 @@ export class QQClient {
         );
         const refreshedExpiry = credentialExpiry(credential);
         // 只打安全元数据：token / cookie 本身一律不进日志。
+        // 续期也是刷新展示信息的好时机（每天最多一次），顺手把昵称 / 头像补齐。
+        this.cookie = credential;
+        const info = await this.accountInfo();
         console.log("qq refresh ok", {
           loginType,
           rotated: cookieValue(credential, "qm_keyst") !== musickey,
@@ -376,8 +387,8 @@ export class QQClient {
         });
         return {
           credential,
-          nickname: text(data.nick),
-          avatarUrl: avatarFor(musicid),
+          nickname: info?.nickname || text(data.nick),
+          avatarUrl: info?.avatarUrl || (loginType === 1 ? "" : avatarFor(musicid)),
           expiresAt: refreshedExpiry,
         };
       }
@@ -414,12 +425,55 @@ export class QQClient {
         refreshRejected ? `refresh_after=${Math.max(retryAt, now + 30 * 60)}` : "",
       ),
     );
+    this.cookie = credential;
+    const info = needProfile ? await this.accountInfo() : null;
     return {
       credential,
-      nickname: profile.nickname,
-      avatarUrl: avatarFor(musicid),
+      nickname: info?.nickname || profile.nickname,
+      avatarUrl: info?.avatarUrl || (loginType === 1 ? "" : avatarFor(musicid)),
       expiresAt: credentialExpiry(credential),
     };
+  }
+
+  /**
+   * 读账号资料：昵称与头像。
+   *
+   * App 扫码的换票响应只有 musicid / musickey，微信账号通常没有 `nick`；
+   * 直接拿 musicid 兜底会显示成 ID。头像也不能用 `q1.qlogo.cn` 的 QQ 头像
+   * （微信 musicid 在 QQ 头像库里不存在），要走 QQ 音乐自己的用户资料接口。
+   *
+   * 这里按 wow-origin 的 `user/detail` 读 `get_user_baseinfo_v2`：它同时返回
+   * `nick` 与 `headurl`，QQ / 微信账号都能拿到。
+   */
+  async accountInfo(): Promise<{ nickname: string; avatarUrl: string } | null> {
+    const musicid = this.uin;
+    if (!musicid) {
+      return null;
+    }
+    try {
+      const data = await this.call("userInfo.BaseUserInfoServer", "get_user_baseinfo_v2", {
+        vec_uin: [musicid],
+      });
+      const map = asRecord(data.map_userinfo) ?? {};
+      const info =
+        asRecord(map[musicid]) ??
+        asRecord(map[`o${musicid}`]) ??
+        asRecord(Object.values(map)[0]);
+      if (!info) {
+        return null;
+      }
+      const nickname = text(info.nick);
+      const avatarUrl = httpsUrl(
+        text(info.headurl) || text(info.headpic) || text(info.avatarUrl),
+      );
+      if (!nickname && !avatarUrl) {
+        return null;
+      }
+      return { nickname, avatarUrl };
+    } catch (error) {
+      console.warn("qq account info unavailable", { message: (error as Error).message });
+      return null;
+    }
   }
 
   /** 用「读自己的资料」探活；返回 null 表示凭据无效。 */
@@ -727,6 +781,11 @@ function numberValue(value: string): number {
 function loginTypeOf(data: Record<string, unknown>, fallback: number): number {
   const value = Number(data.loginType ?? 0);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+/** 平台头像有时是 http://；页面是 https，混用会被浏览器当成不安全内容拦掉。 */
+function httpsUrl(value: string): string {
+  return value.startsWith("http://") ? `https://${value.slice("http://".length)}` : value;
 }
 
 function avatarFor(uin: string): string {
