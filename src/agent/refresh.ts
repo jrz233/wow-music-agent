@@ -14,7 +14,8 @@ import type { AgentStore, PlatformCredentials, StoredPlatform } from "./store";
 import type { Platform } from "../shared/types";
 import { PLATFORMS } from "../shared/types";
 import { refreshNetease } from "../netease/auth";
-import { refreshQQ } from "../qq/auth";
+import { QQSessionInvalidError, refreshQQ } from "../qq/auth";
+import type { QQRenewal } from "../qq/client";
 import { redact } from "./redact";
 
 const REFRESH_AHEAD_SECONDS = 10 * 60;
@@ -26,6 +27,31 @@ export interface RefreshSummary {
   refreshed: Platform[];
   loggedOut: Platform[];
   degraded: Platform[];
+}
+
+/**
+ * 续期串行化。
+ *
+ * DO 的 alarm、cron 的 `runMaintenance` 和面板手动刷新会在同一个 isolate 里交错
+ * 执行；QQ 的续期材料是一次性的，两边同时拿同一份去换，后到的一次会被上游判失效，
+ * 把刚换好的凭据盖成 logged_out。
+ */
+let refreshQueue: Promise<unknown> = Promise.resolve();
+
+function serializedRefresh<T>(task: () => Promise<T>): Promise<T> {
+  const run = refreshQueue.then(task, task);
+  refreshQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** 单次刷新的结果，手动入口据此生成面板提示。 */
+interface RefreshOutcome {
+  state: "ok" | "degraded" | "logged_out";
+  /** QQ 本次续期走到了哪一步；网易云没有这个概念。 */
+  renewal?: QQRenewal;
 }
 
 /**
@@ -53,17 +79,31 @@ export function platformDue(
 }
 
 /** 刷新所有**已到期**的平台会话；返回下一次需要唤醒的时间（秒），无会话返回 null。 */
-export async function refreshDue(store: AgentStore, now = Math.floor(Date.now() / 1000)): Promise<{
-  summary: RefreshSummary;
-  nextAt: number | null;
-}> {
+export function refreshDue(
+  store: AgentStore,
+  now = Math.floor(Date.now() / 1000),
+): Promise<{ summary: RefreshSummary; nextAt: number | null }> {
+  return serializedRefresh(() => refreshAllDue(store, now));
+}
+
+async function refreshAllDue(
+  store: AgentStore,
+  now: number,
+): Promise<{ summary: RefreshSummary; nextAt: number | null }> {
   const summary: RefreshSummary = { refreshed: [], loggedOut: [], degraded: [] };
   for (const platform of PLATFORMS) {
     const row = store.platform(platform);
     if (!row || !platformDue(row, now)) {
       continue;
     }
-    await refreshOne(store, platform, row, summary, now);
+    const outcome = await refreshOne(store, platform, row, now);
+    if (outcome.state === "ok") {
+      summary.refreshed.push(platform);
+    } else if (outcome.state === "logged_out") {
+      summary.loggedOut.push(platform);
+    } else {
+      summary.degraded.push(platform);
+    }
   }
   return { summary, nextAt: nextRefreshAt(store, now) };
 }
@@ -117,13 +157,22 @@ export interface ManualRefreshResult {
 /**
  * 手动刷新一个平台：不等到期，立刻用已保存的凭据续期一次。
  *
- * 令牌本来就有 alarm 自动刷新；这个入口只是让用户在想确认「令牌还有没有效」
- * 时不必等下一次 alarm。失败不会往外抛：面板要把原因显示出来，而不是 500。
+ * 令牌本来就有 alarm 自动刷新；这个入口只是让用户能立刻确认「令牌还有没有效、
+ * 续期还走不走得通」，失败原因也直接回显。失败不会往外抛：面板要把原因显示
+ * 出来，而不是 500。
  */
-export async function refreshPlatformNow(
+export function refreshPlatformNow(
   store: AgentStore,
   platform: Platform,
   now = Math.floor(Date.now() / 1000),
+): Promise<ManualRefreshResult> {
+  return serializedRefresh(() => refreshOneNow(store, platform, now));
+}
+
+async function refreshOneNow(
+  store: AgentStore,
+  platform: Platform,
+  now: number,
 ): Promise<ManualRefreshResult> {
   const row = store.platform(platform);
   if (!row || row.status === "logged_out") {
@@ -133,14 +182,34 @@ export async function refreshPlatformNow(
       nextAt: nextRefreshAt(store, now),
     };
   }
-  const summary: RefreshSummary = { refreshed: [], loggedOut: [], degraded: [] };
-  await refreshOne(store, platform, row, summary, now);
+  const outcome = await refreshOne(store, platform, row, now, true);
   const nextAt = nextRefreshAt(store, now);
-  if (summary.loggedOut.length > 0) {
-    return { state: "logged_out", message: "登录已失效，请重新扫码", nextAt };
+  if (outcome.state === "logged_out") {
+    return {
+      state: "logged_out",
+      message: store.platform(platform)?.lastError || "登录已失效，请重新扫码",
+      nextAt,
+    };
   }
-  if (summary.degraded.length > 0) {
+  if (outcome.state === "degraded") {
     return { state: "degraded", message: "刷新暂时失败，稍后会自动重试", nextAt };
+  }
+  if (outcome.renewal === "none") {
+    return {
+      state: "ok",
+      message: "当前令牌仍有效，但凭据里没有续期材料，到期后需要重新扫码",
+      nextAt,
+    };
+  }
+  if (outcome.renewal === "invalid") {
+    return {
+      state: "ok",
+      message: "续期材料已失效，当前令牌到期后需要重新扫码",
+      nextAt,
+    };
+  }
+  if (outcome.renewal === "rejected") {
+    return { state: "ok", message: "续期被上游拒绝，当前令牌仍有效，稍后会自动重试", nextAt };
   }
   return { state: "ok", message: "令牌已刷新", nextAt };
 }
@@ -149,46 +218,47 @@ async function refreshOne(
   store: AgentStore,
   platform: Platform,
   row: StoredPlatform,
-  summary: RefreshSummary,
   now: number,
-): Promise<void> {
+  force = false,
+): Promise<RefreshOutcome> {
   let credentials: { credential: string; accountId: string } | null;
   try {
     credentials = await store.credentials(platform);
   } catch (error) {
     // 解密失败通常意味着 master key 变了或数据损坏；只能重新扫码。
     store.invalidatePlatform(platform, now, `凭据无法解密，请重新登录（${redact(error)}）`);
-    summary.loggedOut.push(platform);
-    return;
+    return { state: "logged_out" };
   }
   if (!credentials || credentials.credential === "") {
     store.invalidatePlatform(platform, now, "登录已失效，请重新扫码");
-    summary.loggedOut.push(platform);
-    return;
+    return { state: "logged_out" };
   }
 
-  let refreshed: PlatformCredentials | null;
+  let refreshed: (PlatformCredentials & { renewal?: QQRenewal }) | null;
   try {
     // 旧 QQ 凭据可能把昵称存成了 musicid（微信账号尤其常见），且头像也缺；
     // 探活时顺手补一次，不必等用户重新扫码。
     const needProfile = row.nickname === "" || row.nickname === row.accountId;
     refreshed =
       platform === "qq"
-        ? await refreshQQ(credentials.credential, needProfile)
+        ? await refreshQQ(credentials.credential, needProfile, force)
         : await refreshNetease(credentials.credential);
   } catch (error) {
+    if (error instanceof QQSessionInvalidError) {
+      // 上游明确拒绝：续期材料已经作废，保留凭据只会让面板一直显示在线。
+      store.invalidatePlatform(platform, now, `登录已失效，请重新扫码（${error.reason}）`);
+      return { state: "logged_out" };
+    }
     store.markPlatform(platform, now, {
       status: "degraded",
       lastError: `刷新暂时失败，稍后重试：${redact(error)}`,
     });
-    summary.degraded.push(platform);
-    return;
+    return { state: "degraded" };
   }
 
   if (!refreshed) {
     store.invalidatePlatform(platform, now, "登录已失效，请重新扫码");
-    summary.loggedOut.push(platform);
-    return;
+    return { state: "logged_out" };
   }
 
   const merged: PlatformCredentials = {
@@ -200,7 +270,17 @@ async function refreshOne(
       refreshed.expiresAt > now ? refreshed.expiresAt : now + MAX_INTERVAL_SECONDS,
   };
   await store.saveCredentials(platform, merged, now);
-  summary.refreshed.push(platform);
+  // 续期材料已经用不上了：key 还在有效期内，但到期后没人能把它换新。提前写在
+  // 面板上，不要等 72 小时后探活回 1000 才发现。
+  if (refreshed.renewal === "none" || refreshed.renewal === "invalid") {
+    store.markPlatform(platform, now, {
+      lastError:
+        refreshed.renewal === "none"
+          ? "凭据没有续期材料，无法自动续期；到期后需要重新扫码"
+          : "续期材料已失效；到期后需要重新扫码",
+    });
+  }
+  return { state: "ok", renewal: refreshed.renewal };
 }
 
 /** 登录成功后的统一入口：落库并返回下一次刷新时间。 */

@@ -604,6 +604,7 @@ describe("QQ 续期", () => {
     const result = await client.refresh();
 
     expect(result?.nickname).toBe("远未到期");
+    expect(result?.renewal).toBe("none");
     // 30 分钟一次的定时任务不能每次都调续期接口。
     expect(seen.filter((item) => item.body.includes("music.login.LoginServer"))).toHaveLength(0);
     expect(result?.credential).toContain("refresh_token=OLD_REFRESH");
@@ -648,6 +649,7 @@ describe("QQ 续期", () => {
     expect(login).toBeTruthy();
     expect(JSON.parse(login?.body ?? "{}").req_0.param.refresh_token).toBe("OLD_REFRESH");
     expect(result?.nickname).toBe("续期成功");
+    expect(result?.renewal).toBe("rotated");
     expect(result?.credential).toContain("qm_keyst=NEW_KEY");
     // 续期响应只回了新 key：旧 refresh 材料必须保留，否则下一轮再也续不了。
     expect(result?.credential).toContain("refresh_token=OLD_REFRESH");
@@ -748,12 +750,40 @@ describe("QQ 续期", () => {
     const result = await client.refresh();
 
     expect(result?.nickname).toBe("旧凭据仍有效");
+    expect(result?.renewal).toBe("rejected");
     expect(result?.credential).toContain("qm_keyst=OLD_KEY");
     expect(result?.credential).toContain("refresh_token=OLD_REFRESH");
     const retryAt = Number(result?.credential.match(/refresh_after=(\d+)/u)?.[1] ?? 0);
     // 已过本地到期时间，但资料接口还能读：按 30 分钟退避重试。
     expect(retryAt).toBeGreaterThan(now);
     expect(retryAt).toBeLessThanOrEqual(now + 31 * 60);
+  });
+
+  it("续期材料被判失效但 key 还能用：保留凭据，并标记这次续期失败", async () => {
+    stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: { body: JSON.stringify({ code: 0, req_0: { code: 1000, data: {} } }) },
+      },
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: JSON.stringify({ code: 0, data: { creator: { nick: "key 还有效" } } }) },
+      },
+    ]);
+    const client = new QQClient(
+      cred(
+        `musickeyCreateTime=${now - 86400}`,
+        "keyExpiresIn=3600",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+      ),
+    );
+
+    const result = await client.refresh();
+
+    expect(result?.nickname).toBe("key 还有效");
+    expect(result?.renewal).toBe("invalid");
+    expect(result?.credential).toContain("qm_keyst=OLD_KEY");
   });
 
   it("续期遇到网络错误要向上抛，不能误判成已掉线", async () => {
@@ -775,6 +805,104 @@ describe("QQ 续期", () => {
     );
 
     await expect(client.refresh()).rejects.toThrow("network down");
+  });
+
+  it("只有 refresh_key 也能续期：App 扫码不保证回 refresh_token", async () => {
+    const seen = stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: {
+              code: 0,
+              data: { str_musicid: "456", musickey: "NEW_KEY", loginType: 6, keyExpiresIn: 7200 },
+            },
+          }),
+        },
+      },
+    ]);
+    const client = new QQClient(
+      cred(`musickeyCreateTime=${now - 86400}`, "keyExpiresIn=600", "refresh_key=OLD_REFRESH_KEY"),
+    );
+
+    const result = await client.refresh();
+
+    const login = seen.find((item) => item.body.includes("music.login.LoginServer"));
+    expect(JSON.parse(login?.body ?? "{}").req_0.param.refresh_key).toBe("OLD_REFRESH_KEY");
+    expect(result?.renewal).toBe("rotated");
+    expect(result?.credential).toContain("qm_keyst=NEW_KEY");
+  });
+
+  it("手动刷新：离到期还远也真的轮换一次令牌", async () => {
+    const seen = stubFetch([
+      {
+        match: "music.login.LoginServer",
+        reply: {
+          body: JSON.stringify({
+            code: 0,
+            req_0: {
+              code: 0,
+              data: { str_musicid: "456", musickey: "NEW_KEY", loginType: 6, keyExpiresIn: 259200 },
+            },
+          }),
+        },
+      },
+    ]);
+    const client = new QQClient(
+      cred(
+        `musickeyCreateTime=${now}`,
+        "keyExpiresIn=259200",
+        "refresh_token=OLD_REFRESH",
+        "refresh_key=OLD_REFRESH_KEY",
+      ),
+    );
+
+    // 不强制时这种凭据只探活；面板按钮要求真的换一次。
+    const result = await client.refresh(false, true);
+
+    expect(seen.filter((item) => item.body.includes("music.login.LoginServer"))).toHaveLength(1);
+    expect(result?.renewal).toBe("rotated");
+    expect(result?.credential).toContain("qm_keyst=NEW_KEY");
+  });
+
+  it("资料接口限流时只算暂时不可用，不能判掉线", async () => {
+    stubFetch([
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: JSON.stringify({ code: 104604 }) },
+      },
+    ]);
+    const client = new QQClient(cred(`musickeyCreateTime=${now}`, "keyExpiresIn=86400"));
+
+    await expect(client.refresh()).rejects.toThrow("104604");
+    expect(client.invalidReason).toBe("");
+  });
+
+  it("资料接口回 HTML 错误页时不能判掉线", async () => {
+    stubFetch([
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: "<html><body>risk control</body></html>" },
+      },
+    ]);
+    const client = new QQClient(cred(`musickeyCreateTime=${now}`, "keyExpiresIn=86400"));
+
+    await expect(client.refresh()).rejects.toThrow("资料接口");
+    expect(client.invalidReason).toBe("");
+  });
+
+  it("资料接口明确回登录失效才算掉线，并记下状态码", async () => {
+    stubFetch([
+      {
+        match: "fcg_get_profile_homepage",
+        reply: { body: JSON.stringify({ code: 1000 }) },
+      },
+    ]);
+    const client = new QQClient(cred(`musickeyCreateTime=${now}`, "keyExpiresIn=86400"));
+
+    expect(await client.refresh()).toBeNull();
+    expect(client.invalidReason).toContain("1000");
   });
 });
 

@@ -77,7 +77,17 @@ export interface QQRefreshResult {
   avatarUrl: string;
   /** 0 表示上游没给有效期，调用方需要自己兜底。 */
   expiresAt: number;
+  /**
+   * 这次续期走到了哪一步，面板据此提示「自动续期还走不走得通」：
+   * - `rotated`：换到了新 key；
+   * - `invalid`：上游判定续期材料已失效，当前 key 到期后只能重新扫码；
+   * - `rejected`：续期被上游暂时拒绝（限流 / 设备数 / 风控页），之后会重试；
+   * - `none`：凭据里没有续期材料，从未尝试续期。
+   */
+  renewal: QQRenewal;
 }
+
+export type QQRenewal = "rotated" | "invalid" | "rejected" | "none";
 
 /**
  * 距真实到期不到这个时间才去调续期接口。
@@ -95,9 +105,13 @@ const REFRESH_AHEAD_SECONDS = 6 * 60 * 60;
  * 保持续期材料新鲜（与参考实现一致），又不会像以前那样每 30 分钟打一次。
  */
 const MAX_ROTATE_SECONDS = 24 * 60 * 60;
+/** 资料接口用它表示登录态已经不能再用；其余非 0 码（限流、风控、参数）都只是暂时问不出来。 */
+const INVALID_CREDENTIAL_CODES = new Set([1000, 104400, 104401]);
 
 export class QQClient {
   cookie: string;
+  /** `refresh()` 判掉线的原因（只含状态码），供面板展示；不含凭据。 */
+  invalidReason = "";
 
   constructor(cookie = "") {
     this.cookie = cookie;
@@ -286,15 +300,18 @@ export class QQClient {
    * 其余时候只读一次资料接口确认登录态，避免把续期额度耗在无意义的轮换上。
    *
    * `needProfile` 用于修复旧账号「昵称显示成 ID / 没有头像」：探活时顺手读一次
-   * 用户资料，把展示信息补回来。
+   * 用户资料，把展示信息补回来。`force` 让面板的手动刷新真正滚动一次令牌，
+   * 而不是只做一次探活。
    *
-   * 返回 null 表示凭据已失效（需要重新扫码）；网络错误向上抛（上层标记
-   * degraded 稍后重试），不会被误当成「已掉线」。
+   * 返回 null 表示凭据已经不能再用（凭据本身缺少 uin/qm_keyst，或上游明确判失效），
+   * 需要重新扫码；网络错误与暂时性异常（限流、风控、HTML 错误页）向上抛，由上层
+   * 标记 degraded 稍后重试，不会被误当成「已掉线」。
    */
-  async refresh(needProfile = false): Promise<QQRefreshResult | null> {
+  async refresh(needProfile = false, force = false): Promise<QQRefreshResult | null> {
     const musicid = this.uin;
     const musickey = this.musickey;
     if (!musicid || !musickey) {
+      this.invalidReason = "凭据缺少 uin 或 qm_keyst";
       return null;
     }
     const now = Math.floor(Date.now() / 1000);
@@ -315,7 +332,10 @@ export class QQClient {
         ? now >= rotateAt
         : expiresAt === 0 || expiresAt - REFRESH_AHEAD_SECONDS <= now;
     let refreshRejected = false;
-    if (refreshToken && refreshKey && nearExpiry) {
+    let renewal: QQRenewal = "none";
+    // App 扫码的登录响应不一定带 refresh_token；refresh_key 单独也能续期。
+    const hasRefreshMaterial = refreshToken !== "" || refreshKey !== "";
+    if (hasRefreshMaterial && (force || nearExpiry)) {
       const openid = cookieValue(this.cookie, "openid");
       const accessToken = cookieValue(this.cookie, "access_token");
       const expiredIn = Number(cookieValue(this.cookie, "expired_at")) || 0;
@@ -360,6 +380,7 @@ export class QQClient {
           throw error;
         }
         refreshRejected = true;
+        renewal = "rejected";
         console.warn("qq refresh failed", { message: (error as Error).message });
       }
       if (result && result.code === 0) {
@@ -390,10 +411,12 @@ export class QQClient {
           nickname: info?.nickname || text(data.nick),
           avatarUrl: info?.avatarUrl || (loginType === 1 ? "" : avatarFor(musicid)),
           expiresAt: refreshedExpiry,
+          renewal: "rotated",
         };
       }
       if (result) {
         refreshRejected = true;
+        renewal = INVALID_CREDENTIAL_CODES.has(result.code) ? "invalid" : "rejected";
         // 20279=设备数超限、104604=限流、1000/104400/104401=已过期。旧凭据可能
         // 仍然可用，交给下面的资料探活判断；这里只记录可定位的元数据。
         console.warn("qq refresh rejected", {
@@ -405,9 +428,15 @@ export class QQClient {
         });
       }
     }
-    const profile = await this.profile();
-    if (!profile) {
+    const probe = await this.probeProfile();
+    if (probe.state === "invalid") {
+      this.invalidReason =
+        probe.code > 0 ? `资料接口返回 ${probe.code}` : "凭据缺少 uin 或 qm_keyst";
       return null;
+    }
+    if (probe.state === "unknown") {
+      // 限流、风控、非 JSON 错误页都只说明「这次问不出来」，不能当成掉线。
+      throw unavailable(`QQ 音乐资料接口暂时不可用 (${probe.code})`);
     }
     // 探活通过：把这次实际使用的设备身份写回凭据。旧凭据缺 android_id 时，
     // `deviceFrom` 会临时生成一个，如果不写回，下一轮又会变成另一台设备。
@@ -429,9 +458,10 @@ export class QQClient {
     const info = needProfile ? await this.accountInfo() : null;
     return {
       credential,
-      nickname: info?.nickname || profile.nickname,
+      nickname: info?.nickname || probe.nickname,
       avatarUrl: info?.avatarUrl || (loginType === 1 ? "" : avatarFor(musicid)),
       expiresAt: credentialExpiry(credential),
+      renewal,
     };
   }
 
@@ -476,12 +506,21 @@ export class QQClient {
     }
   }
 
-  /** 用「读自己的资料」探活；返回 null 表示凭据无效。 */
-  async profile(): Promise<{ nickname: string } | null> {
+  /**
+   * 用「读自己的资料」探活。
+   *
+   * 只有上游明确回登录失效码才算掉线；限流、风控、非 JSON 错误页返回
+   * `unknown`，让上层退避重试而不是删除凭据。
+   */
+  async probeProfile(): Promise<
+    | { state: "ok"; nickname: string }
+    | { state: "invalid"; code: number }
+    | { state: "unknown"; code: number }
+  > {
     const musicid = this.uin;
     const musickey = this.musickey;
     if (!musicid || !musickey) {
-      return null;
+      return { state: "invalid", code: 0 };
     }
     const url = new URL(PROFILE);
     url.search = new URLSearchParams({
@@ -501,12 +540,18 @@ export class QQClient {
       headers: { Referer: REFERER, Cookie: this.credentialCookie() },
     });
     const payload = await jsonOf(response).catch(() => null);
-    if (!payload || Number(payload.code ?? -1) !== 0) {
-      return null;
+    if (!payload) {
+      return { state: "unknown", code: -1 };
     }
-    const data = asRecord(payload.data) ?? {};
-    const creator = asRecord(data.creator) ?? {};
-    return { nickname: text(creator.nick) };
+    const code = Number(payload.code ?? -1);
+    if (code === 0) {
+      const data = asRecord(payload.data) ?? {};
+      const creator = asRecord(data.creator) ?? {};
+      return { state: "ok", nickname: text(creator.nick) };
+    }
+    return INVALID_CREDENTIAL_CODES.has(code)
+      ? { state: "invalid", code }
+      : { state: "unknown", code };
   }
 
   /** 只要换票后的凭据；不要把二维码阶段的 Cookie 一起发给数据接口。 */
@@ -585,15 +630,6 @@ export class QQClient {
     }
     const list = Array.isArray(payload.cdlist) ? payload.cdlist : [];
     return asRecord(list[0]) ?? null;
-  }
-
-  /** 探活：资料接口能读即视为凭据仍有效。 */
-  async alive(): Promise<boolean> {
-    try {
-      return (await this.profile()) !== null;
-    } catch {
-      return false;
-    }
   }
 }
 

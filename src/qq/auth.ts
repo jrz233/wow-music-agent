@@ -13,8 +13,7 @@
  */
 
 import type { PlatformCredentials } from "../agent/store";
-import { PlatformNetworkError } from "../shared/http";
-import { QQClient, type QQLoginState } from "./client";
+import { QQClient, type QQLoginState, type QQRenewal } from "./client";
 import type { MobileQRSocket } from "./mqtt";
 
 export interface QQLoginStart {
@@ -89,26 +88,39 @@ function loginPoll(result: QQLoginState, cookie: string): QQLoginPoll {
 }
 
 /**
- * 探活 / 续期。凭据失效返回 null；网络错误向上抛（标记 degraded）。
+ * 上游明确判定凭据已经不能再用，只能重新扫码。
  *
- * `needProfile` 让探活顺手补回昵称 / 头像（旧凭据可能只存了 musicid）。
+ * 与网络错误、限流、风控页区分开：只有这个异常会让上层清除凭据；其余异常都是
+ * 暂时性的，标记 degraded 后退避重试。
+ */
+export class QQSessionInvalidError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "QQSessionInvalidError";
+  }
+}
+
+export interface QQRefreshOutcome extends PlatformCredentials {
+  /** 本次续期走到了哪一步；`invalid` / `none` 表示自动续期已经走不通。 */
+  renewal: QQRenewal;
+}
+
+/**
+ * 探活 / 续期。凭据被上游明确判失效时抛 `QQSessionInvalidError`；网络错误与
+ * 暂时性异常原样向上抛（标记 degraded）。
+ *
+ * `needProfile` 让探活顺手补回昵称 / 头像（旧凭据可能只存了 musicid）；
+ * `force` 让面板的手动刷新真正滚动一次令牌，而不是只做一次探活。
  */
 export async function refreshQQ(
   cookie: string,
   needProfile = false,
-): Promise<PlatformCredentials | null> {
+  force = false,
+): Promise<QQRefreshOutcome> {
   const client = new QQClient(cookie);
-  let result;
-  try {
-    result = await client.refresh(needProfile);
-  } catch (error) {
-    if (error instanceof PlatformNetworkError) {
-      throw error;
-    }
-    return null;
-  }
+  const result = await client.refresh(needProfile, force);
   if (!result) {
-    return null;
+    throw new QQSessionInvalidError(client.invalidReason || "登录已失效");
   }
   return {
     accountId: client.uin,
@@ -116,5 +128,6 @@ export async function refreshQQ(
     avatarUrl: result.avatarUrl || "",
     credential: result.credential,
     expiresAt: result.expiresAt || Math.floor(Date.now() / 1000) + FALLBACK_TTL_SECONDS,
+    renewal: result.renewal,
   };
 }
