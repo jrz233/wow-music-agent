@@ -226,7 +226,16 @@ export class QQClient {
         const { code, data, cookies, topCode, topMsg } = await context.call(
           "music.login.LoginServer",
           "Login",
-          { musicid: musicid ? new RawNumber(musicid) : 0, qrCodeID: qrcodeID, token: event.key },
+          {
+            musicid: musicid ? new RawNumber(musicid) : 0,
+            qrCodeID: qrcodeID,
+            token: event.key,
+            // 官方二维码登录页的换票参数。needCookie 让上游把 refresh_key / openid
+            // 等续期材料一起发下来；不带它同样能换到可用的 key，但 72 小时后过期
+            // 就只能重新扫码。
+            loginType: 6,
+            needCookie: 1,
+          },
           { tmeLoginType: 6 },
         );
         if (code !== 0) {
@@ -263,16 +272,16 @@ export class QQClient {
     fallbackLoginType: number,
     cookieLines: string[],
   ): Promise<QQLoginState> {
-    const loginType = loginTypeOf(data, fallbackLoginType);
     const credential = credentialCookies(
       data,
       device,
-      loginType,
+      loginTypeOf(data, fallbackLoginType),
       applySetCookieLines(new Map(), cookieLines),
       this.cookie,
       contextFor(device).snapshot(),
     );
     const musicid = cookieValue(credential, "uin");
+    const loginType = Number(cookieValue(credential, "loginType")) || fallbackLoginType;
     // 换票响应里的 nick 对微信账号经常为空；用换回来的凭据再读一次资料，
     // 昵称和头像都以平台侧的真实值优先。
     this.cookie = credential;
@@ -702,7 +711,9 @@ function credentialCookies(
     ["uin", musicid],
     ["qm_keyst", musickey],
     ["musicid", musicid],
-    ["loginType", String(loginType)],
+    // 续期请求的 tmeLoginType 要按账号类型（QQ=2、微信=1），不是二维码入口的 6。
+    // 响应没带 loginType 时按 musickey 前缀判断，和参考实现一致。
+    ["loginType", String(loginTypeOf(data, loginType, musickey))],
     ["android_id", device.androidId],
     ["open_udid", device.openUdid],
     ["open_udid2", device.openUdid2],
@@ -813,10 +824,22 @@ function numberValue(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-/** 换票响应里通常带 `loginType`（QQ=2、微信=1、App=6）；缺失时用入口的默认值。 */
-function loginTypeOf(data: Record<string, unknown>, fallback: number): number {
+/**
+ * 换票响应里通常带 `loginType`（QQ=2、微信=1）；缺失时按 musickey 前缀判断，
+ * 判断不出来才用入口的默认值。
+ */
+function loginTypeOf(data: Record<string, unknown>, fallback: number, musickey = ""): number {
   const value = Number(data.loginType ?? 0);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+  if (Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (musickey.startsWith("W_X")) {
+    return 1;
+  }
+  if (musickey.startsWith("Q_H_L")) {
+    return 2;
+  }
+  return fallback;
 }
 
 /** 平台头像有时是 http://；页面是 https，混用会被浏览器当成不安全内容拦掉。 */

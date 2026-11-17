@@ -376,6 +376,7 @@ describe("QQ 音乐 App 扫码", () => {
                 nick: "App 用户",
                 loginType: 6,
                 refresh_token: "APP_REFRESH",
+                refresh_key: "APP_REFRESH_KEY",
                 openid: "APP_OPENID",
               },
             },
@@ -395,6 +396,7 @@ describe("QQ 音乐 App 扫码", () => {
     expect(state.result.credential).toContain("qm_keyst=APP_KEY");
     expect(state.result.credential).toContain("loginType=6");
     expect(state.result.credential).toContain("refresh_token=APP_REFRESH");
+    expect(state.result.credential).toContain("refresh_key=APP_REFRESH_KEY");
     // 登录时的设备身份不能换掉，否则续期会遇到风控。
     expect(state.result.credential).toContain("android_id=0011223344556677");
     expect(state.result.account.nickname).toBe("App 用户");
@@ -404,6 +406,10 @@ describe("QQ 音乐 App 扫码", () => {
     expect(request.req_0.param.musicid).toBe(456);
     expect(request.req_0.param.qrCodeID).toBe("QR_ID");
     expect(request.req_0.param.token).toBe("APP_KEY");
+    // 官方登录页的换票参数：不声明 loginType / needCookie 时上游不回 refresh_key，
+    // 换到的 key 到期后只能重新扫码。
+    expect(request.req_0.param.loginType).toBe(6);
+    expect(request.req_0.param.needCookie).toBe(1);
     expect(request.comm.tmeLoginType).toBe("6");
     // 换票也必须带同一套设备指纹，否则上游只回笼统的业务错误（50006）。
     expect(request.comm.aid).toMatch(/^[0-9a-f]{16}$/u);
@@ -461,6 +467,39 @@ describe("QQ 音乐 App 扫码", () => {
     expect(state.result.account.avatarUrl).toBe("https://thirdwx.qlogo.cn/avatar");
     const info = seen.find((item) => item.body.includes("get_user_baseinfo_v2"));
     expect(JSON.parse(info?.body ?? "{}").req_0.param.vec_uin).toEqual(["456"]);
+  });
+
+  it("换票响应没带 loginType：按 musickey 前缀判定账号类型", async () => {
+    const cases = [
+      { key: "Q_H_L_APP_KEY", want: "loginType=2" },
+      { key: "W_X_APP_KEY", want: "loginType=1" },
+    ];
+    for (const item of cases) {
+      const payload = JSON.stringify({
+        cookies: { qqmusic_uin: { value: "456" }, qqmusic_key: { value: item.key } },
+      });
+      stubQQSocket({ type: "cookies", payload });
+      stubFetch([
+        {
+          match: "music.login.LoginServer",
+          reply: {
+            body: JSON.stringify({
+              code: 0,
+              req_0: { code: 0, data: { musicid: 456, musickey: item.key } },
+            }),
+          },
+        },
+      ]);
+
+      const client = new QQClient(
+        "android_id=0011223344556677; open_udid=00112233445566778899aabbccddeeff",
+      );
+      const state = await client.checkMobileQR("QR_ID", 2_000);
+      expect(state.state).toBe("success");
+      if (state.state !== "success") return;
+      // 续期请求的 tmeLoginType 必须是账号类型，不能是二维码入口的 6。
+      expect(state.result.credential).toContain(item.want);
+    }
   });
 
   it("19 位微信 musicid 原样写进 Login：先转 Number 会丢精度", async () => {
